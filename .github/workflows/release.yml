@@ -9,7 +9,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    # Pinned to windows-2022 (Visual Studio 2022). The shared CMakePresets.json
+    # uses the "Visual Studio 17 2022" generator, which the windows-latest image
+    # (migrated to VS2026) no longer provides. Keep until the project moves to VS2026.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
 

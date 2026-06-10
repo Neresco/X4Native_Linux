@@ -217,3 +217,14 @@ X4_FUNC(int32_t, FactionRelation_LookupReasonID, (void* unused, const void* reas
 // game_api.cpp without x4_manual_types.h's full struct declarations). The
 // type-safe wrapper in x4n_faction.h casts to/from X4FactionClass*.
 X4_FUNC(float, FactionRelation_GetFloat, (void* faction_a, void* faction_b))
+
+// Screenshot_ArmSingleShot — arms a single native screenshot. Sets the engine's
+// single-shot pending flag; the render thread then writes
+// screenshots/screen_<datetime>.<ext> (PNG by default) including the on-screen
+// UI, and works in exclusive fullscreen (it is the engine's own capture).
+// subdir = X4String* (Release-ABI std::string, 32 bytes): pass an EMPTY string
+// for a plain top-level screenshot; a non-empty name nests it under that sub-dir.
+// MUST be called on the game UI/main thread — it allocates and creates the
+// output directory through the game VFS. Not exported.
+// Verified: v9.00 build 900-611726, RVA 0x0122DFA0. Per-build RVA from version_db.
+X4_FUNC(void, Screenshot_ArmSingleShot, (const void* subdir_str))

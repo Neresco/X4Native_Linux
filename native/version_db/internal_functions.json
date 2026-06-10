@@ -380,6 +380,21 @@
       "900-607242": { "rva": "0x0030F500" },
       "900-607977": { "rva": "0x00310800" },
       "900-611726": { "rva": "0x0034CA70" }
+    },
+    "Screenshot_ArmSingleShot": {
+      "_find_hints": {
+        "method": "unique_string",
+        "steps": [
+          "1. Search for string 'screen_%Y-%m-%d_%H-%M-%S' (the single-shot screenshot filename pattern) — referenced by exactly two adjacent functions.",
+          "2. This is the one that takes a single std::string* arg (an optional sub-directory): it strcpy's 'screenshots' into a global string and validates the sub-dir via 'Illegal sub-directory name '%s''. The OTHER referencer builds 'screenshots/<timestamp>/info.txt' (the high-res screenshot MODE) — not this one.",
+          "3. Verify: reads the std::string size at +0x10 and short-circuits the sub-dir logic when empty; sets the single-shot pending flag (a global byte) to 1 near the end; ~0x6ce bytes.",
+          "4. The render-thread writer (a separate function) consumes that pending flag and writes screenshots/screen_<datetime>.<ext> (PNG by default), keeping the UI visible."
+        ],
+        "verify_strings": ["screenshots", "screen_%Y-%m-%d_%H-%M-%S", "Illegal sub-directory name '%s'"],
+        "byte_sig": "48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D 6C 24 E0 48 81 EC 20",
+        "byte_sig_note": "First 31 bytes: save rbx/rsi/rdi to home area; push rbp/r12/r13/r14/r15; lea rbp,[rsp-20h]; sub rsp,120h. Distinctive 0x120 stack frame."
+      },
+      "900-611726": { "rva": "0x0122DFA0" }
     }
   }
 }

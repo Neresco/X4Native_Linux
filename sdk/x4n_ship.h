@@ -274,6 +274,14 @@ inline SubordinateCounts enumerate_subordinates_by_class(uint64_t commander_id) 
     SubordinateCounts out;
     auto* g = ::x4n::game();
     if (!g) return out;
+    // GetAllFactionShips lists non-controllable deployables (satellites /
+    // resource probes / nav beacons / mines / laser towers). The engine's
+    // GetNumSubordinatesOfGroup logs "Failed to retrieve controllable" and
+    // returns 0 for each non-controllable id — swamping the debug log. Skip
+    // them up front: find_component + is_a are both log-free, and a
+    // non-controllable has no subordinates anyway (counts stay zeroed).
+    const auto* cmd = ::x4n::entity::find_component(commander_id);
+    if (!cmd || !::x4n::entity::is_a(cmd, ::x4n::GameClass::Controllable)) return out;
     for (int group = 1; group <= 10; ++group) {
         uint32_t n = g->GetNumSubordinatesOfGroup(commander_id, group);
         if (n == 0) continue;

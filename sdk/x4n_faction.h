@@ -15,7 +15,7 @@
 // GetFactionRelationStatus2, SetFactionRelationToPlayerFaction, GetFactionDetails.
 // See docs/rev/FACTION_RELATIONS.md §2.2 + §3.1 for the reverse-engineering notes.
 //
-// Use case: galaxy-wide NPC-NPC relation matrix snapshots (X4Strategos §4.1).
+// Use case: galaxy-wide NPC-NPC relation matrix snapshots.
 // Cost: ~21 factions × 21 = 441 reads per matrix burst — sub-millisecond.
 //
 // **Side-effect — cleanup-on-read.** Every relation read may mutate the

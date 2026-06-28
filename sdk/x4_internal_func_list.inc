@@ -186,10 +186,10 @@ X4_FUNC(void, EventQueue_InsertOrDispatch, (void* event_source, void* event_obje
 // Fixed by aligning the SDK declaration with the vanilla calling
 // convention and updating the call site to construct a string_view struct.
 //
-// Use case: drift-protection wrapper for the companion-side fallback string
-// table in `companion/src/validation.rs::VALID_RELATION_REASONS`. Calling
-// the FFI lets us stay in lockstep with vanilla even if Egosoft adds new
-// reasons — fallback table remains as the offline-data path.
+// Use case: drift-protection wrapper for a consumer-side fallback table of
+// valid relation reason strings. Calling the FFI lets a consumer stay in
+// lockstep with vanilla even if Egosoft adds new reasons — a static fallback
+// table remains as the offline-data path.
 //
 // Verified: v9.00 build 606138 docs at FACTION_RELATIONS.md (§3.2 + §10
 // table — note the table at line 499 lists 0x002CBF00; §3.2 header lists
@@ -207,8 +207,8 @@ X4_FUNC(int32_t, FactionRelation_LookupReasonID, (void* unused, const void* reas
 // polling continuously gardens the boost map.
 //
 // Caller convention: rcx=a, rdx=b, returns float in xmm0. NOT exported.
-// Use case: galaxy-wide NPC-NPC relation matrix snapshot for X4Strategos
-// §4.1 Session 2a (~21 factions × 21 = 441 reads per cycle = trivial cost).
+// Use case: galaxy-wide NPC-NPC relation matrix snapshot (~21 factions × 21
+// = 441 reads per cycle = trivial cost).
 //
 // Verified: v9.00 build 606138, RVA 0x0030F700. Per-build RVA must come from
 // version_db. Function size 0x37 bytes. See docs/rev/FACTION_RELATIONS.md §2.2.

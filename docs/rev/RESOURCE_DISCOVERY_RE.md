@@ -199,11 +199,11 @@ It assigns mining ships to sectors based on ware demand, not based on resource d
 
 ---
 
-## 6. Implications for X4Strategos
+## 6. Implications for a Consuming Mod
 
 ### The Problem
 
-`GetDiscoveredSectorResources` is **player-perspective only**. If X4Strategos calls it for NPC faction intelligence gathering:
+`GetDiscoveredSectorResources` is **player-perspective only**. If a consumer calls it for NPC faction intelligence gathering:
 - All NPC factions see exactly what the player has discovered
 - Factions managing sectors the player has never visited see zero resources
 - Factions "learn" about resources when the player deploys probes, even in distant sectors
@@ -217,21 +217,21 @@ This completely breaks the faction AI model.
 | **A. Sector script properties** (`bestyieldrating`, `resources`) | Global, unfiltered, matches NPC AI behavior | Not callable from native C++ (MD/Lua only); no current/max yield split |
 | **B. Static mapdefaults.xml** data | Complete resource definitions per sector; available at load time | No depletion tracking; requires parsing game data files |
 | **C. GetMineablesAtSectorPos** | Per-position, not discovery-filtered | Requires knowing positions; very tactical, not strategic |
-| **D. Companion-side resource model** | Full control, per-faction fog-of-war | Must bootstrap from static data; must track depletion ourselves |
+| **D. Consumer-side resource model** | Full control, per-faction fog-of-war | Must bootstrap from static data; must track depletion itself |
 | **E. GetDiscoveredSectorResources with deferred use** | Simple API, includes depletion data | Player-only; breaks fog-of-war; all factions see same data |
 
 ### Recommended Approach
 
-**Option D (Companion-side resource model) combined with Option B (static data bootstrap):**
+**Option D (Consumer-side resource model) combined with Option B (static data bootstrap):**
 
 1. **Bootstrap from mapdefaults.xml:** At game load, parse the `<resourceareas>` entries per sector to build a static resource catalog. Each sector gets a list of (ware, yield_rating, resource_area_count).
 
-2. **Track depletion via GetDiscoveredSectorResources:** When the player discovers resources in a sector, the companion receives the current/max yield data. This gives us depletion deltas for sectors the player has visited.
+2. **Track depletion via GetDiscoveredSectorResources:** When the player discovers resources in a sector, the consumer receives the current/max yield data. This gives depletion deltas for sectors the player has visited.
 
-3. **Per-faction discovery in companion:** The companion maintains its own per-faction discovery state:
+3. **Per-faction discovery in the consumer:** The consumer maintains its own per-faction discovery state:
    - Factions "know" about resources in sectors they own or have had mining operations in.
    - Factions can "discover" resources via their mining ships operating in a sector (synthetic discovery).
-   - The companion's LLM brain decides where to explore based on static resource potential.
+   - The consumer decides where to explore based on static resource potential.
 
 4. **Yield ratings via MD bridge (if needed):** For runtime yield data without discovery filtering, we can query `$Sector.bestyieldrating.{$ware}` via the MD/Lua bridge. This returns unfiltered data accessible to all factions.
 

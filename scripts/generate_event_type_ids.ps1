@@ -225,6 +225,20 @@ function Size-ToCType {
     return "uint8_t[$size]"
 }
 
+# Per-(type_id:decimal_offset) C-type overrides. event_layouts.csv carries only
+# offset:size, so Size-ToCType emits EVERY 4-byte field as uint32_t — wrong for
+# 4-byte floats: a relation value reinterpret-cast as uint32 is garbage. Keyed
+# "<type_id>:<offset>". Verified vs common.xsd + Egosoft MD scripts (cinematic-
+# camera.xml / diplomacy.xml) + EVENT_SYSTEM.md RE — see
+# docs/rev/FACTION_RELATIONS.md §5.5 (FactionRelationChangedEvent layout).
+# NOTE: the size->uint32 default is a SYSTEMIC latent bug for every 4-byte float
+# event field; this table currently fixes only the confirmed FactionRelation-
+# Changed (188) case. Extend it as other float fields are verified.
+$FieldTypeOverrides = @{
+    '188:40' = 'float'   # FactionRelationChanged.new_relation (p+0x28), post-change [-1,1]
+    '188:44' = 'float'   # FactionRelationChanged.old_relation (p+0x2C), pre-change  [-1,1]
+}
+
 # --- Generate x4_md_events.h ---
 $hdr = [System.Collections.Generic.List[string]]::new()
 $hdr.Add("// ==========================================================================")
@@ -294,6 +308,8 @@ foreach ($e in $entries) {
     $payloadParams = @($xsdParams | Where-Object { $_.Key -ne 'object' })
     foreach ($f in $layout.Fields) {
         $ctype = Size-ToCType $f.Size
+        $ovKey = "$($e.Id):$($f.Offset)"
+        if ($FieldTypeOverrides.ContainsKey($ovKey)) { $ctype = $FieldTypeOverrides[$ovKey] }
         $fieldName = "field_$($f.Offset.ToString('x2'))"
         if ($fieldIdx -lt $payloadParams.Count) {
             $fieldName = $payloadParams[$fieldIdx].FieldName

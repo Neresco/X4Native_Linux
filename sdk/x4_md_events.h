@@ -2525,8 +2525,8 @@ namespace x4n::md
         double   timestamp;         // Game time (X4MdEvent)
         uint64_t faction;
         uint64_t other_faction;
-        uint32_t new_relation;
-        uint32_t old_relation;
+        float new_relation;
+        float old_relation;
         uint32_t relationchangereason;
 
         static FactionRelationChangedData from(const X4MdEvent* ev) {
@@ -2536,8 +2536,8 @@ namespace x4n::md
                 ev->timestamp,
                 *reinterpret_cast<const uint64_t*>(p + 0x18),
                 *reinterpret_cast<const uint64_t*>(p + 0x20),
-                *reinterpret_cast<const uint32_t*>(p + 0x28),
-                *reinterpret_cast<const uint32_t*>(p + 0x2C),
+                *reinterpret_cast<const float*>(p + 0x28),
+                *reinterpret_cast<const float*>(p + 0x2C),
                 *reinterpret_cast<const uint32_t*>(p + 0x30)
             };
         }

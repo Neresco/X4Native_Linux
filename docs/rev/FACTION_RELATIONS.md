@@ -35,8 +35,9 @@ flowchart TD
     subgraph "Write Path"
         W1[SetFactionRelationToPlayerFaction<br/>Lua FFI] --> W2[LookupReasonID<br/>binary search]
         W2 --> W3[FactionRelation_ApplyMutation]
-        W4[MD set_faction_relation] --> W5[MD_FactionRelationAction_Execute]
-        W5 --> W6[FactionRelation_SetForEntity]
+        W4[MD set/add_faction_relation] --> W5[MD_FactionRelationAction_Execute]
+        W5 -->|"set (absolute, direct)"| W3
+        W5 -->|"add (additive)"| W6[FactionRelation_SetForEntity]
         W6 --> W3
         W3 --> W7[RemoveBoost old]
         W3 --> W8[InsertBoost new]
@@ -417,7 +418,21 @@ Always calls `FactionRelation_RemoveBoost` first to clear any existing boost for
 **Size:** `0x83` bytes
 **Signature:** `void FactionRelation_SetForEntity(FactionClass* from, FactionClass* to, float delta /*xmm2*/, int reason_id /*r9d*/)`
 
-This is the function that MD's `set_faction_relation` calls. Despite the name "set", it is **additive**: it reads the current relation float, adds the incoming delta, and passes the sum as the new absolute boost to `ApplyMutation`.
+> **Correction (2026-06-29, IDA build 900-611726 — confirmed ADDITIVE, and this
+> is the `add_faction_relation` path).** Re-decompiled at the instruction level
+> (this build: `SetForEntity` at `0x1409DA850`). The function IS additive:
+> `0x1409da89f call ReadRawFloat` (current `C`) → `0x1409da8a4 addss xmm0, xmm6`
+> (`C + value`) → `0x1409da8b9 call ApplyMutation` with the sum as the absolute
+> boost. The in-path `ReadRawFloat` FEEDS the write value (it is not merely the
+> event `old_value`). **This function is invoked by `add_faction_relation`, NOT
+> `set_faction_relation`** (see §3.6): `set` routes DIRECTLY to `ApplyMutation`
+> (absolute), so the prior "net absolute via SetForEntity" correction was based on
+> a mistaken premise and is **superseded**. The decompiler drops the float arg
+> (renders it as an uninitialised local) and hides the `addss` — read the disasm.
+> Net effect by command: `add_faction_relation value="X"` adds `X` to the current
+> relation; `set_faction_relation value="X"` makes the relation become `X`.
+
+This is the function that MD's `add_faction_relation` calls (NOT `set_faction_relation` — see §3.6). It is **additive**: it reads the current relation float, adds the incoming value, and passes the sum as the new absolute boost to `ApplyMutation`.
 
 ```c
 void FactionRelation_SetForEntity(
@@ -449,10 +464,10 @@ void FactionRelation_SetForEntity(
 
 The MD action handler dispatches two different MD commands based on the action type ID at `action+8`:
 
-| Action ID | Hex | MD Command | Target Function |
-|-----------|-----|------------|-----------------|
-| 1652 | 0x674 | `set_faction_relation` | `FactionRelation_SetForEntity` (additive) |
-| 2192 | 0x890 | `add_faction_relation` | `FactionRelation_ApplyMutation` (absolute boost) |
+| MD Command | Action-type id (build-volatile) | Target Function | Semantics |
+|------------|--------------------------------|-----------------|-----------|
+| `set_faction_relation` | `0x89D` = 2205 (build 611726) | `FactionRelation_ApplyMutation` (direct) | **ABSOLUTE**: relation becomes `clamp(value, [-1,1])`, bidirectional |
+| `add_faction_relation` | `0x67E` = 1662 (build 611726) | `FactionRelation_SetForEntity` | **ADDITIVE**: relation becomes `clamp(current + value)`, bidirectional |
 
 ```c
 void MD_FactionRelationAction_Execute(MDAction* action, void* a2, void* a3) {
@@ -465,19 +480,30 @@ void MD_FactionRelationAction_Execute(MDAction* action, void* a2, void* a3) {
 
     int action_type = *(int*)(action + 8);
 
-    if (action_type == 0x674) {
-        // set_faction_relation: additive via SetForEntity
-        FactionRelation_SetForEntity(faction_a, faction_b, value /*xmm2*/, reason_id /*r9d*/);
-    } else if (action_type == 0x890) {
-        // add_faction_relation: absolute boost via ApplyMutation
+    if (action_type == 0x89D) {        // set_faction_relation (id 2205, build 611726)
+        // ABSOLUTE: routes DIRECTLY to ApplyMutation (value is the final relation)
         FactionRelation_ApplyMutation(faction_a, faction_b, value /*xmm2*/, reason_id /*r9d*/, 1 /*bidirectional*/);
+    } else if (action_type == 0x67E) { // add_faction_relation (id 1662, build 611726)
+        // ADDITIVE: SetForEntity reads current, adds value, hands the sum to ApplyMutation
+        FactionRelation_SetForEntity(faction_a, faction_b, value /*xmm2*/, reason_id /*r9d*/);
     }
 }
 ```
 
 **Important semantic difference:**
-- `set_faction_relation value="X"` passes `X` to `SetForEntity`, which computes `current + X` as the new absolute boost. So `value` is a delta.
-- `add_faction_relation value="X"` passes `X` directly to `ApplyMutation` as the absolute new boost target (clamped to [-1.0, 1.0]).
+- `set_faction_relation value="X"`: `X` is the **absolute** target — the relation becomes `X` (clamped `[-1,1]`), set on BOTH directions. Routes straight to `ApplyMutation`.
+- `add_faction_relation value="X"`: `X` is a **delta** added to the current relation (`SetForEntity` reads current, adds `X`, hands the sum to `ApplyMutation` as the absolute boost).
+
+> **Correction (2026-06-29, IDA build 900-611726 — supersedes the earlier
+> 2026-06-29 note):** the earlier table had the two keywords **SWAPPED**. Proven
+> via the schema element-descriptor table (`{name_ptr, id}`:
+> `set_faction_relation` = `0x89D`/2205, `add_faction_relation` = `0x67E`/1662) and
+> the executor's dispatch (`MD_FactionRelationAction_Execute` @ `0x140BDACC0`:
+> 2205 → `ApplyMutation` direct = absolute, 1662 → `SetForEntity` = additive). The
+> names are intuitive after the swap: "**set**" sets absolutely, "**add**" adds to
+> current. Action-type ids shift between builds — **bind by keyword, not by the raw
+> id** (the old `0x674`/`0x890` were a prior build, also assigned to the wrong
+> commands). Both paths write the **boost** map (`relbase+0x50`).
 
 Both support NPC-to-NPC factions (not player-only). The only player-specific function is the exported `SetFactionRelationToPlayerFaction`.
 
@@ -562,7 +588,7 @@ int reason_id = FactionRelation_LookupReasonID(faction_node_ptr, &reason_sv);
 FactionRelation_ApplyMutation(faction_a, faction_b, 0.5f, reason_id, 1);
 ```
 
-**Recommended approach for X4Strategos**: Call `FactionRelation_ApplyMutation` directly rather than `SetForEntity`. ApplyMutation takes an **absolute** boost value (clamped to [-1.0, 1.0]), which is simpler to reason about. SetForEntity adds a delta which requires knowing the current value first.
+**Recommended approach**: Call `FactionRelation_ApplyMutation` directly rather than `SetForEntity`. ApplyMutation takes an **absolute** boost value (clamped to [-1.0, 1.0]), which is simpler to reason about. SetForEntity adds a delta which requires knowing the current value first.
 
 **Calling convention note**: The float parameter is in **xmm2** (third register slot), not passed on the stack. This requires the C++ function pointer to be declared with a float in the third parameter position, or use inline assembly / intrinsics to ensure the float lands in xmm2.
 
@@ -727,6 +753,25 @@ int UIIntToLED(int ui) {
 | +40 | float | old_value |
 | +44 | float | new_value |
 | +48 | int | reason_id |
+
+> **Correction (2026-06-29, IDA build 900-611726 — supersedes the prior 2026-06-29
+> note):** the ORIGINAL table above is **correct** — PHYSICAL `+0x28` = old
+> (pre-change), `+0x2C` = new (post-change). Proven by instruction-level dataflow:
+> `ApplyMutation` (`0x1409DA580`) reads the relation BEFORE the boost insert into
+> `xmm7` (`call GetFloat` @ `0x1409da617`) and stores it to `[evt+0x28]`
+> (`movss` @ `0x1409da75b`), then reads AFTER into `xmm6` (`0x1409da6b5`) and stores
+> to `[evt+0x2C]` (`0x1409da760`); the player `RelationChangedEvent` builder
+> (`0x1409DA260`) uses the same `old@0x28` / `new@0x2C` convention. The earlier
+> "`+0x28` = new" claim conflated the MD param-**LIST** order (`common.xsd` documents
+> `param3 = [new relation, old relation, reason]`) with the physical struct **offset**
+> order — they are REVERSE: MD `param3.{1}` (new) maps to physical `+0x2C`, not
+> `+0x28`. Any raw-struct overlay reading `+0x28` therefore reads the **OLD** value.
+>
+> **SDK-header note:** the generated struct `FactionRelationChangedData` in
+> `sdk/x4_md_events.h` labels `new_relation@+0x28` / `old_relation@+0x2C`, which is
+> **inverted** relative to the physical store above (a raw-event overlay at `+0x28`
+> reads OLD). Consumers that read these floats via the raw struct should swap;
+> MD-`param3`-based consumers are unaffected by the physical-offset order.
 
 ### 5.6 FactionRelationRangeChangedEvent (0x28 bytes)
 

@@ -727,7 +727,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             // Process is terminating. Other DLLs' statics may already be
             // destroyed, all threads killed, heap potentially corrupted.
             // The OS reclaims all memory, handles, pipes, and file locks.
-            // Companion detects broken pipe and exits on its own.
+            // The connected peer detects the broken pipe and exits on its own.
             return TRUE;
         }
         // Dynamic unload (FreeLibrary): safe to clean up.

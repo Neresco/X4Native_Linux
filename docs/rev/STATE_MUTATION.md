@@ -146,7 +146,7 @@ uint32_t __fastcall CreateOrder3(UniverseID controllableid, const char* orderid,
 
 **Internal function:** `CreateOrderInternal` at `0x140424A90` (RVA `0x424A90`)
 
-Bypasses the player-ownership check. Used by X4Strategos for NPC faction orders.
+Bypasses the player-ownership check. Useful for issuing NPC faction orders from native code.
 
 ```c
 // a1 = X4Component* entity, a2 = AlignedStringView* order_id, a3 = mode, a4 = override

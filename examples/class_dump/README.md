@@ -3,7 +3,7 @@
 One-shot research extension that dumps X4's internal type registries to CSV files.
 Run once per game build, copy CSVs to `X4Native/reference/`, regenerate SDK headers.
 
-Companion extension: `event_probe` (scans builder code for struct layouts).
+Sibling extension: `event_probe` (scans builder code for struct layouts).
 
 ## What It Dumps
 

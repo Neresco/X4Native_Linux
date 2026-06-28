@@ -1613,8 +1613,6 @@ Offsets churn between builds, the engine-internal allocator/handle plumbing has 
 | `0x140B0D940` | Money-kind ancestor resolver wrapper |
 | `0x14039B470` | Polymorphic ancestor walker |
 
-Full RE write-up: `D:\Projects\X4Strategos\.claude\reports\2026-05-03_buildresourcevalue_re.md`.
-
 ---
 
 ## 13. Related Documents

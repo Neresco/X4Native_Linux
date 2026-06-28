@@ -1,6 +1,6 @@
 # X4 Player Notification Systems
 
-Research into how X4 displays messages to the player and how X4Strategos can use these channels.
+Research into how X4 displays messages to the player and how an extension can use these channels.
 
 **Sources**: SDK function list, XSD schema definitions, game MD/Lua scripts, binary analysis.
 
@@ -8,7 +8,7 @@ Research into how X4 displays messages to the player and how X4Strategos can use
 
 ## Summary
 
-7 notification channels exist. 3 are immediately usable via MD bridge for the Player Advisor:
+7 notification channels exist. 3 are immediately usable via MD bridge for a player-facing advisor:
 
 | Channel | Best For | Trigger | Max Text |
 |---------|----------|---------|----------|
@@ -52,7 +52,7 @@ Scrolling notification bar in the top-right. 1-4 line messages, configurable tim
 - Row pairs: `['Left text', 'Right text', 'Row 2 left', 'Row 2 right']`
 - With color: `['Normal', ['Red text', 255, 64, 64]]`
 
-**Custom notification types**: X4Strategos can define `extension/libraries/notificationtypes.xml` with a `strategos_advice` category so players can toggle advisor notifications independently.
+**Custom notification types**: An extension can define `extension/libraries/notificationtypes.xml` with a custom advice category so players can toggle its notifications independently.
 
 **Ticker Cache**: All `show_notification` calls are automatically recorded in the Notifications tab of the logbook -- free persistence.
 
@@ -171,7 +171,7 @@ Could create sector watch alerts for the advisor ("Monitor Hatikvah Border for X
 
 ## Channel 5: News Feed (Limited)
 
-Static extension announcements from content.xml. `GetNextNewsItem2` iterates, `SetNewsItemHidden` hides. Not runtime-usable -- only for "X4Strategos is active" type messages.
+Static extension announcements from content.xml. `GetNextNewsItem2` iterates, `SetNewsItemHidden` hides. Not runtime-usable -- only for "extension is active" type messages.
 
 ---
 
@@ -193,10 +193,10 @@ Full mission lifecycle. Too heavyweight for advisory messages. Possible Phase 3+
 
 **Recommended**: Sequential variable-setting pattern:
 ```lua
-AddUITriggeredEvent("x4strategos", "set_var", "category|general")
-AddUITriggeredEvent("x4strategos", "set_var", "title|Economic Advisory")
-AddUITriggeredEvent("x4strategos", "set_var", "text|Your hydrogen supply is critical...")
-AddUITriggeredEvent("x4strategos", "write_logbook", "true") -- triggers MD cue
+AddUITriggeredEvent("myextension", "set_var", "category|general")
+AddUITriggeredEvent("myextension", "set_var", "title|Economic Advisory")
+AddUITriggeredEvent("myextension", "set_var", "text|Your hydrogen supply is critical...")
+AddUITriggeredEvent("myextension", "write_logbook", "true") -- triggers MD cue
 ```
 
 MD side receives `set_var` events, stores in MD variables, then `write_logbook` triggers the actual `write_to_logbook` action with the accumulated variables.

@@ -26,11 +26,12 @@ public:
     static void shutdown();
 
     // Load internal function RVA database for the given game build.
-    // Tries primary_build first (e.g. "900-beta2"), falls back to fallback_build
-    // (e.g. "900") so beta builds can reuse the last known-good RVA entry.
+    // Only exact build-label matches are used — applying another build's RVAs
+    // would patch wrong addresses. Entries carrying a byte signature
+    // (_find_hints.byte_sig) are verified against the live binary before
+    // being accepted; a mismatch disables that one function.
     static void load_internal_db(const std::string& ext_root,
-                                 const std::string& primary_build,
-                                 const std::string& fallback_build = {});
+                                 const std::string& build_label);
 
     // The resolved function pointer table (NULL if not initialized)
     static X4GameFunctions* table();

@@ -1,9 +1,28 @@
 #include "event_system.h"
 #include "logger.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <algorithm>
 
 namespace x4n {
+
+// SEH wrapper — must be a separate function (no C++ objects needing unwind).
+// Mirrors seh_call_hook in hook_manager.cpp: a faulting subscriber must not
+// take down the game from the event dispatch path (which includes the
+// per-frame on_native_frame_update and the engine's MD dispatch hot path).
+static int seh_call_event(EventCallback cb, const char* event_name,
+                          void* data, void* userdata) {
+    __try {
+        cb(event_name, data, userdata);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
 
 std::unordered_map<std::string, std::vector<EventSystem::Subscription>>
     EventSystem::s_subscribers;
@@ -87,7 +106,11 @@ void EventSystem::md_fire_before(uint32_t type_id, void* payload) {
         snapshot = subs;
     }
     for (auto& sub : snapshot) {
-        sub.callback(nullptr, payload, sub.userdata);
+        if (seh_call_event(sub.callback, nullptr, payload, sub.userdata) != 0) {
+            Logger::error("MD event {}: before-subscriber #{} crashed (SEH) — removed",
+                          type_id, sub.id);
+            unsubscribe(sub.id);
+        }
     }
 }
 
@@ -101,7 +124,11 @@ void EventSystem::md_fire_after(uint32_t type_id, void* payload) {
         snapshot = subs;
     }
     for (auto& sub : snapshot) {
-        sub.callback(nullptr, payload, sub.userdata);
+        if (seh_call_event(sub.callback, nullptr, payload, sub.userdata) != 0) {
+            Logger::error("MD event {}: after-subscriber #{} crashed (SEH) — removed",
+                          type_id, sub.id);
+            unsubscribe(sub.id);
+        }
     }
 }
 
@@ -118,7 +145,11 @@ void EventSystem::fire(const char* event_name, void* data) {
     }
 
     for (auto& sub : snapshot) {
-        sub.callback(event_name, data, sub.userdata);
+        if (seh_call_event(sub.callback, event_name, data, sub.userdata) != 0) {
+            Logger::error("Event '{}': subscriber #{} crashed (SEH) — removed",
+                          event_name, sub.id);
+            unsubscribe(sub.id);
+        }
     }
 }
 

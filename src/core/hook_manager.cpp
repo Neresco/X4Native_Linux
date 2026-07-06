@@ -207,6 +207,8 @@ HookedFunction* HookManager::ensure_hooked(const char* function_name) {
     hf.name = function_name;
     hf.target = target;
     hf.trampoline = nullptr;
+    hf.detour = nullptr;
+    hf.detour_module = nullptr;
 
     auto [ins, _] = s_hooks.emplace(function_name, std::move(hf));
     return &ins->second;
@@ -250,8 +252,40 @@ void* HookManager::ensure_detour(const char* function_name, void* detour_fn) {
     }
 
     hf->trampoline = trampoline;
+    hf->detour = detour_fn;
+    // The detour code lives in the calling extension's DLL (typed_detour
+    // template instantiation). Remember which module that is so unload can
+    // detect when other extensions still route through it.
+    hf->detour_module = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       static_cast<LPCSTR>(detour_fn), &hf->detour_module);
     Logger::info("HookManager: detour installed for '{}'", function_name);
     return trampoline;
+}
+
+void HookManager::protect_dangling_detours(HMODULE unloading_module) {
+    std::lock_guard lock(s_mutex);
+    if (!s_initialized || !unloading_module) return;
+
+    for (auto& [name, hf] : s_hooks) {
+        if (hf.detour_module != unloading_module) continue;
+        if (hf.before_hooks.empty() && hf.after_hooks.empty()) continue;
+
+        // Other extensions still dispatch through detour code that lives in
+        // the DLL about to be unloaded. A survivor re-install is not possible
+        // yet (extensions cache the trampoline pointer in their own statics),
+        // so pin the module — it stays mapped until process exit, which is a
+        // small leak instead of a guaranteed crash on the next hooked call.
+        HMODULE pinned = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           static_cast<LPCSTR>(hf.detour), &pinned);
+        Logger::warn("HookManager: '{}' is still hooked by other extensions through "
+                     "a detour owned by the unloading DLL — DLL pinned in memory to "
+                     "prevent a crash. Hot-reloading this extension will fail until "
+                     "the other extensions release their hooks.", name);
+    }
 }
 
 // ---------------------------------------------------------------------------

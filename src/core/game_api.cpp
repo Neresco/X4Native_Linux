@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstring>
 #include <fstream>
+#include <vector>
 
 namespace x4n {
 
@@ -127,13 +128,59 @@ uintptr_t GameAPI::exe_base() {
     return reinterpret_cast<uintptr_t>(s_x4_module);
 }
 
+// Parse a "48 8B ?? C4" style signature into byte + mask vectors.
+// Returns false on any malformed token.
+static bool parse_byte_sig(const std::string& sig,
+                           std::vector<uint8_t>& bytes,
+                           std::vector<uint8_t>& mask) {
+    bytes.clear();
+    mask.clear();
+    size_t i = 0;
+    while (i < sig.size()) {
+        if (sig[i] == ' ') { ++i; continue; }
+        if (i + 1 >= sig.size()) return false;
+        char a = sig[i], b = sig[i + 1];
+        if (a == '?' && b == '?') {
+            bytes.push_back(0);
+            mask.push_back(0);
+        } else {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hex(a), lo = hex(b);
+            if (hi < 0 || lo < 0) return false;
+            bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+            mask.push_back(1);
+        }
+        i += 2;
+    }
+    return !bytes.empty();
+}
+
+// SEH-guarded signature compare — separate function, no C++ objects.
+// Returns 1 on match, 0 on mismatch, -1 if the address is unreadable.
+static int seh_sig_match(const uint8_t* addr, const uint8_t* bytes,
+                         const uint8_t* mask, size_t n) {
+    __try {
+        for (size_t i = 0; i < n; ++i)
+            if (mask[i] && addr[i] != bytes[i]) return 0;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
 void GameAPI::load_internal_db(const std::string& ext_root,
-                               const std::string& primary_build,
-                               const std::string& fallback_build) {
+                               const std::string& build_label) {
     std::string db_path = ext_root + "native/version_db/internal_functions.json";
     std::ifstream file(db_path);
     if (!file.is_open()) {
-        Logger::debug("GameAPI: No internal functions database found");
+        Logger::error("GameAPI: internal functions database not found at {} — "
+                      "frame tick, MD events and radar events are DISABLED "
+                      "(is native/version_db/ missing from this install?)", db_path);
         return;
     }
 
@@ -143,21 +190,54 @@ void GameAPI::load_internal_db(const std::string& ext_root,
 
         auto base = reinterpret_cast<uintptr_t>(s_x4_module);
         int count = 0;
+        int no_build = 0;
+        int sig_rejected = 0;
 
         for (auto& [name, entry] : db["functions"].items()) {
-            const std::string* key = nullptr;
-            if (entry.contains(primary_build))                              key = &primary_build;
-            else if (!fallback_build.empty() && entry.contains(fallback_build)) key = &fallback_build;
-            if (!key) continue;
-            auto& ver = entry[*key];
-            if (!ver.contains("rva") || !ver["rva"].is_string()) continue;
+            // Per-entry guard: one malformed entry must not discard the rest.
+            try {
+                if (!entry.contains(build_label)) { no_build++; continue; }
+                auto& ver = entry[build_label];
+                if (!ver.contains("rva") || !ver["rva"].is_string()) continue;
 
-            auto rva_str = ver["rva"].get<std::string>();
-            uintptr_t rva = std::stoull(rva_str, nullptr, 16);
-            void* addr = reinterpret_cast<void*>(base + rva);
-            s_internal_funcs[name] = addr;
-            count++;
+                auto rva_str = ver["rva"].get<std::string>();
+                uintptr_t rva = std::stoull(rva_str, nullptr, 16);
+                void* addr = reinterpret_cast<void*>(base + rva);
+
+                // Verify the byte signature (if the entry has one) against the
+                // live binary — a stale RVA then disables this one function
+                // instead of hooking a wrong address.
+                if (entry.contains("_find_hints") &&
+                    entry["_find_hints"].contains("byte_sig") &&
+                    entry["_find_hints"]["byte_sig"].is_string()) {
+                    std::vector<uint8_t> bytes, sig_mask;
+                    auto sig = entry["_find_hints"]["byte_sig"].get<std::string>();
+                    if (parse_byte_sig(sig, bytes, sig_mask)) {
+                        int m = seh_sig_match(static_cast<const uint8_t*>(addr),
+                                              bytes.data(), sig_mask.data(), bytes.size());
+                        if (m != 1) {
+                            Logger::warn("GameAPI: '{}' byte signature {} at RVA {} — "
+                                         "function disabled (stale RVA for this game build?)",
+                                         name, m == 0 ? "mismatch" : "unreadable", rva_str);
+                            sig_rejected++;
+                            continue;
+                        }
+                    }
+                }
+
+                s_internal_funcs[name] = addr;
+                count++;
+            } catch (const std::exception& e) {
+                Logger::warn("GameAPI: skipping malformed DB entry '{}': {}", name, e.what());
+            }
         }
+
+        if (no_build > 0)
+            Logger::warn("GameAPI: {} internal function(s) have no RVA entry for build {} — skipped",
+                         no_build, build_label);
+        if (sig_rejected > 0)
+            Logger::warn("GameAPI: {} internal function(s) failed signature verification — disabled",
+                         sig_rejected);
 
         // Populate internal function pointers into the unified game table
         auto* tbl_base = reinterpret_cast<char*>(&s_table);

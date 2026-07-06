@@ -1,0 +1,6 @@
+{
+    "library": "native\\x4native_crash_test.dll",
+    "priority": 300,
+    "min_api_version": 1,
+    "autoreload": false
+}

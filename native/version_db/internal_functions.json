@@ -30,7 +30,8 @@
           "4. Verify: heavy callee count (200+), large function (~0x580 bytes in 603098, ~0xB40 bytes in 603990)"
         ],
         "verify_strings": ["Cannot find XML file component macro '%s' in index '%s'"],
-        "byte_sig_note": "Large function (~0x580 bytes) with FNV-1a hash loop. Prologue varies by version."
+        "byte_sig": "44 88 44 24 18 48 89 54 24 10 48 89 4C 24 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 41 0F B6 F8 4C 8B D2 48 8B D9 45 33 E4",
+        "byte_sig_note": "Prologue + body head: home (r8b,rdx,rcx); push rbp,rbx,rsi,rdi,r12-r15; lea rbp,[rsp-N]; sub rsp,M; movzx edi,r8b; mov r10,rdx; mov rbx,rcx; xor r12d,r12d. Frame lea disp + sub imm wildcarded. Extended past prologue to be unique (1 match in .text). Captured @ 611726 0xA2F0D0, verified via 'Cannot find XML file component macro' + FNV prime 0x1000193."
       },
       "900-606138": { "rva": "0x009EBF10" },
       "900-607242": { "rva": "0x009EF7B0" },
@@ -46,7 +47,8 @@
           "3. Verify: passes 14 arguments to CreateDynamicInterior at a single call site",
           "4. Verify: size ~0xB49 bytes (the other caller is ~0x300)"
         ],
-        "byte_sig_note": "MD action handler class. Size ~0xB49. Prologue may vary."
+        "byte_sig": "48 89 5C 24 10 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 4D 8B F8",
+        "byte_sig_note": "Prologue: home (rbx,rcx); push rbp,rsi,rdi,r12-r15 (no push rbx); lea rbp,[rsp-N]; sub rsp,M; mov r15,r8. Frame lea disp + sub imm wildcarded. Captured @ 611726 0xBA6890. Identity by caller_chain (0 direct callers — indirect MD handler dispatch), not string."
       },
       "900-606138": { "rva": "0x00B64E50" },
       "900-607242": { "rva": "0x00B687C0" },
@@ -355,7 +357,9 @@
           "6. Alt (string cache miss): decompile SetFactionRelationToPlayerFaction (PE export) — the callee taking (faction_node, string_view{reasonid,len}) and returning the int32 reason id passed to the mutation dispatcher is this function.",
           "7. Cross-check the docs at `X4Native/docs/rev/FACTION_RELATIONS.md §3.2`."
         ],
-        "verify_strings": ["relationchangereason."]
+        "verify_strings": ["relationchangereason."],
+        "byte_sig": "4C 8B DC 49 89 4B 08 53 56 57 41 55 48 83 EC ?? 48 8B 05 ?? ?? ?? ?? 48 8D 1D ?? ?? ?? ?? 4C 8B EA 48 8D 0C 40 48 8D 0C CD 00 00 00 00 48 8D 04 19 48 89 44 24 ?? 48 B8 AB AA AA AA AA AA AA 2A",
+        "byte_sig_note": "Prologue + ×24 index setup: mov r11,rsp; mov [r11+8],rcx; push rbx,rsi,rdi,r13; sub rsp,N; mov rax,[rip+tableptr]; lea rbx,[rip+table]; mov r13,rdx; lea rcx,[rax+rax*2]; lea rcx,[rcx*8]; lea rax,[rcx+rbx]; mov [rsp+X],rax; mov rax,2AAAAAAAAAAAAAABh. Frame imm, both RIP disps, and frame store offset wildcarded. NOT unique (~10 matches — the ×24 sorted-table binary-search idiom is common; the distinguishing table address is build-variable, hence wildcarded). Sufficient as an RVA-anchored check. Captured @ 611726 0x30C2F0, verified via callers SetFactionRelationToPlayerFaction/SetRelationBoostToFaction + memcmp + magic 0x2AAAAAAAAAAAAAAB."
       },
       "900-606138": { "rva": "0x002CBF00" },
       "900-607242": { "rva": "0x002CBE10" },
@@ -373,8 +377,8 @@
           "5. Cross-check the docs at `X4Native/docs/rev/FACTION_RELATIONS.md §2.2`."
         ],
         "verify_strings": [],
-        "byte_sig": "4C 8B C2 48 3B D1 75 06 F3 0F 10 05",
-        "byte_sig_note": "Prologue (606138): mov r8,rdx; cmp rdx,rcx; jnz short; movss xmm0,Y. Distinctive — function-pair-equality fast path with movss xmm0,RIP-relative. Prologue register allocation may vary between builds (no match in 611726) — fall back to the ApplyMutation caller-chain method above."
+        "byte_sig": "4C 8B C2 48 3B D1 75 ?? F3 0F 10 05",
+        "byte_sig_note": "Prologue: mov r8,rdx; cmp rdx,rcx; jnz short; movss xmm0,Y. Distinctive — function-pair-equality fast path with movss xmm0,RIP-relative. The jnz displacement varies between builds (06 in 606138, 09 in 611726) — wildcarded. If the whole prologue changes, fall back to the ApplyMutation caller-chain method above."
       },
       "900-606138": { "rva": "0x0030F700" },
       "900-607242": { "rva": "0x0030F500" },
@@ -391,8 +395,8 @@
           "4. The render-thread writer (a separate function) consumes that pending flag and writes screenshots/screen_<datetime>.<ext> (PNG by default), keeping the UI visible."
         ],
         "verify_strings": ["screenshots", "screen_%Y-%m-%d_%H-%M-%S", "Illegal sub-directory name '%s'"],
-        "byte_sig": "48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D 6C 24 E0 48 81 EC 20",
-        "byte_sig_note": "First 31 bytes: save rbx/rsi/rdi to home area; push rbp/r12/r13/r14/r15; lea rbp,[rsp-20h]; sub rsp,120h. Distinctive 0x120 stack frame."
+        "byte_sig": "48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC ?? ?? ?? ?? 48 8B F9",
+        "byte_sig_note": "Prologue: home (rbx,rsi,rdi); push rbp,r12-r15; lea rbp,[rsp-N]; sub rsp,M; mov rdi,rcx. Frame lea disp + sub imm wildcarded (were literal + truncated mid-immediate before). Captured @ 611726 0x122DFA0, verified via all three screenshot strings."
       },
       "900-611726": { "rva": "0x0122DFA0" }
     }

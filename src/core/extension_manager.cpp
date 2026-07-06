@@ -561,6 +561,9 @@ void ExtensionManager::unload_extension(ExtensionInfo& ext) {
     // since hook callbacks point into the extension's DLL code). Keyed on
     // extension_id — the canonical unique identifier.
     HookManager::remove_all_for_extension(ext.extension_id.c_str());
+    // If other extensions still route through a detour whose code lives in
+    // this DLL, pin it so FreeLibrary can't unmap live hook code.
+    HookManager::protect_dangling_detours(ext.module);
     if (ext.module) {
         FreeLibrary(ext.module);
         ext.module = nullptr;

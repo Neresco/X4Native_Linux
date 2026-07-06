@@ -54,7 +54,6 @@ template<auto MPtr>
 struct state {
     static inline void* trampoline = nullptr;
     static inline const char* name = nullptr;
-    static inline bool detour_installed = false;
 };
 
 // --- Function name lookup from X4GameFunctions member offset ---
@@ -94,11 +93,13 @@ const char* get_name() {
 
 template<auto MPtr>
 bool install_detour(void* detour_fn) {
-    if (state<MPtr>::detour_installed) return true;
+    // Always consult the core — no local installed-flag early-out. If every
+    // callback on this function was removed since the last install, the core
+    // dropped the MinHook entirely; re-hooking then needs a fresh detour and
+    // a fresh trampoline. _ensure_detour is idempotent when already hooked.
     void* t = ::x4n::detail::g_api->_ensure_detour(get_name<MPtr>(), detour_fn);
     if (!t) return false;
     state<MPtr>::trampoline = t;
-    state<MPtr>::detour_installed = true;
     return true;
 }
 

@@ -57,7 +57,42 @@ jobs:
           Copy-Item native/x4native_64.dll $staging/native/
           Copy-Item native/x4native_core.dll $staging/native/
 
+          # version_db is REQUIRED at runtime: without it the core cannot
+          # resolve internal functions and frame tick / MD events / radar
+          # events silently disable (see docs/RELEASE.md package layout).
+          New-Item -ItemType Directory -Path $staging/native/version_db -Force | Out-Null
+          Copy-Item native/version_db/*.json $staging/native/version_db/
+
           Compress-Archive -Path $staging -DestinationPath "pkg/x4native-v$ver.zip"
+
+      - name: Verify end-user package manifest
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.full_version }}"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path "pkg/x4native-v$ver.zip"))
+          try {
+              $entries = $zip.Entries.FullName | ForEach-Object { $_ -replace '\\', '/' }
+          } finally {
+              $zip.Dispose()
+          }
+
+          $required = @(
+              'x4native/content.xml',
+              'x4native/ui.xml',
+              'x4native/ui/x4native.lua',
+              'x4native/md/x4native_main.xml',
+              'x4native/t/0001-L044.xml',
+              'x4native/native/x4native_64.dll',
+              'x4native/native/x4native_core.dll',
+              'x4native/native/version_db/internal_functions.json'
+          )
+          $missing = $required | Where-Object { $entries -notcontains $_ }
+          if ($missing) {
+              Write-Error "End-user zip is missing required files:`n$($missing -join "`n")"
+              exit 1
+          }
+          Write-Host "End-user package manifest OK ($($entries.Count) entries)"
 
       # --- SDK Package ---
       - name: Package SDK zip

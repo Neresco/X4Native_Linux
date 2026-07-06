@@ -4,6 +4,9 @@ build/
 # Local developer config (contains machine-specific X4 game path)
 CMakeUserPresets.json
 
+# Editor config (machine-local)
+.vscode/
+
 # Built DLLs and debug symbols
 native/*.dll
 native/*.pdb

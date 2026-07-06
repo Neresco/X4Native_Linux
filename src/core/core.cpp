@@ -29,6 +29,7 @@
 #include <windows.h>
 
 #include <array>
+#include <cstdio>
 #include <string>
 #include <cmath>
 
@@ -462,8 +463,7 @@ static void impl_set_extension_setting(const char* ext_id, const char* key,
 // Exported functions (called by proxy DLL)
 // ---------------------------------------------------------------------------
 
-extern "C" __declspec(dllexport)
-int core_init(CoreInitContext* ctx) {
+static int core_init_impl(CoreInitContext* ctx) {
     g_ext_root             = ctx->ext_root;
     g_get_lua_property     = ctx->get_lua_property;
     g_get_lua_property_str = ctx->get_lua_property_str;
@@ -483,29 +483,55 @@ int core_init(CoreInitContext* ctx) {
     g_version_string = std::string(X4_GAME_VERSION_LABEL) +
                        " (game: " + g_game_version + ")";
 
+    // 3b. Build gate — version.dat only exposes the coarse version ("900"),
+    //     so this catches major game updates (9.00 → 9.10), not intra-version
+    //     builds (those are covered per-function by byte-signature checks in
+    //     load_internal_db). On mismatch, all RVA-derived features are
+    //     disabled: compiled offsets would read/patch wrong memory.
+    const std::string& detected_build = x4n::Version::build();
+    const std::string  expected_build = std::to_string(X4_GAME_TYPES_BUILD);
+    // Empty detected_build (version.dat unreadable; PE fallback doesn't set
+    // it) deliberately falls through to normal mode — the per-function
+    // byte-signature checks in load_internal_db remain the safety net there.
+    const bool rva_safe_mode =
+        !detected_build.empty() && detected_build != expected_build;
+    if (rva_safe_mode) {
+        x4n::Logger::error("GAME VERSION MISMATCH: running build {} but this "
+                           "X4Native was compiled for build {} ({}). RVA-dependent "
+                           "features (frame tick, MD events, offsets, internal "
+                           "functions) are DISABLED. Exported game functions remain "
+                           "available. Update X4Native to a build matching your game.",
+                           detected_build, expected_build, X4_GAME_VERSION_LABEL);
+    }
+
     // 4. Game API — resolve X4.exe function pointers
     x4n::GameAPI::init();
-    x4n::GameAPI::load_internal_db(g_ext_root, X4_GAME_VERSION_LABEL,
-                                    std::to_string(X4_GAME_TYPES_BUILD));
+    if (!rva_safe_mode)
+        x4n::GameAPI::load_internal_db(g_ext_root, X4_GAME_VERSION_LABEL);
 
     // 5. Logger — open file sink in <profile>\x4native\x4native.log and
     //    flush the buffer produced by steps 1-4.
     x4n::Logger::open_files();
 
-    // 4b. Resolve pointer fields in game offsets (used by extensions and core hooks)
-    resolve_offset_pointers(x4n::GameAPI::exe_base());
+    // 4b. Resolve pointer fields in game offsets (used by extensions and core
+    //     hooks). Skipped in safe mode — stale RVAs point at wrong memory;
+    //     null pointers make SDK helpers fail their existing guards instead.
+    if (!rva_safe_mode)
+        resolve_offset_pointers(x4n::GameAPI::exe_base());
 
     // 5. Hook manager — MinHook initialization
     x4n::HookManager::init();
 
-    // 5b. Native frame tick hook (core-owned, fires on_native_frame_update)
-    install_frame_tick_hook();
+    if (!rva_safe_mode) {
+        // 5b. Native frame tick hook (core-owned, fires on_native_frame_update)
+        install_frame_tick_hook();
 
-    // 5c. [OBSOLETE] Radar visibility hook — superseded by MD event hook (type_id 376)
-    install_radar_visibility_hook();
+        // 5c. [OBSOLETE] Radar visibility hook — superseded by MD event hook (type_id 376)
+        install_radar_visibility_hook();
 
-    // 5d. MD event dispatch hook (core-owned, fires on_md_before/on_md_after)
-    install_md_event_hook();
+        // 5d. MD event dispatch hook (core-owned, fires on_md_before/on_md_after)
+        install_md_event_hook();
+    }
 
     // 6. Extension manager
     g_raise_lua_event = ctx->raise_lua_event;
@@ -535,9 +561,43 @@ int core_init(CoreInitContext* ctx) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Exported entry points — no C++ exception may cross the DLL/C boundary.
+// The proxy calls these raw; an escaping std::bad_alloc / format_error would
+// unwind through C frames into LuaJIT (undefined behavior).
+// ---------------------------------------------------------------------------
+
+// Allocation-free — a handler that allocates could throw again and defeat
+// the guard (e.g. on bad_alloc).
+static void report_boundary_exception(const char* where, const char* what) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "X4Native core: exception in %s: %s\n",
+             where, what ? what : "(unknown)");
+    OutputDebugStringA(buf);
+}
+
+extern "C" __declspec(dllexport)
+int core_init(CoreInitContext* ctx) {
+    try {
+        return core_init_impl(ctx);
+    } catch (const std::exception& e) {
+        report_boundary_exception("core_init", e.what());
+        return 1;
+    } catch (...) {
+        report_boundary_exception("core_init", nullptr);
+        return 1;
+    }
+}
+
 extern "C" __declspec(dllexport)
 void core_shutdown() {
-    impl_shutdown();
+    try {
+        impl_shutdown();
+    } catch (const std::exception& e) {
+        report_boundary_exception("core_shutdown", e.what());
+    } catch (...) {
+        report_boundary_exception("core_shutdown", nullptr);
+    }
 }
 
 // ---------------------------------------------------------------------------

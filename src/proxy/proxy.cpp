@@ -255,6 +255,30 @@ static bool reload_core() {
     return load_core();
 }
 
+// Exception guards for the load/reload paths. These run inside Lua C-function
+// frames — a C++ exception (e.g. bad_alloc from the std::string path work)
+// escaping into LuaJIT is undefined behavior, so contain it here.
+static bool first_load_guarded() noexcept {
+    try {
+        g_ext_root       = detect_ext_root();
+        g_core_path      = g_ext_root + "native\\x4native_core.dll";
+        g_core_live_path = g_ext_root + "native\\x4native_core_live.dll";
+        return load_core();
+    } catch (...) {
+        OutputDebugStringA("X4Native proxy: exception during first core load\n");
+        return false;
+    }
+}
+
+static bool reload_core_guarded() noexcept {
+    try {
+        return reload_core();
+    } catch (...) {
+        OutputDebugStringA("X4Native proxy: exception during core reload\n");
+        return false;
+    }
+}
+
 /// Returns true if the on-disk core is newer than the live copy.
 static bool core_needs_reload() {
     WIN32_FILE_ATTRIBUTE_DATA disk_attr = {}, live_attr = {};
@@ -514,7 +538,7 @@ static int l_get_loaded_extensions(lua_State* L) {
 }
 
 static int l_reload(lua_State* L) {
-    x4n::lua::pushboolean(L, reload_core() ? 1 : 0);
+    x4n::lua::pushboolean(L, reload_core_guarded() ? 1 : 0);
     return 1;
 }
 
@@ -642,6 +666,25 @@ static int l_should_autoreload(lua_State* L) {
 #endif // X4N_WITH_RELOAD
 
 // ---------------------------------------------------------------------------
+// Lua C-function exception guard
+//
+// Every l_* forwarder ends up in core code that allocates (Logger's
+// std::format, JSON serialization, settings marshalling). A C++ exception
+// escaping into LuaJIT's C frames is undefined behavior, so the whole API
+// table is registered through this shim. L_error's longjmp is unaffected:
+// with /EHsc, catch(...) sees only C++ exceptions, not SEH unwinds.
+// ---------------------------------------------------------------------------
+template <int (*Fn)(lua_State*)>
+static int lua_guarded(lua_State* L) {
+    try {
+        return Fn(L);
+    } catch (...) {
+        OutputDebugStringA("X4Native proxy: exception in Lua API call\n");
+        return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point — called by Lua: package.loadlib("...dll", "luaopen_x4native")
 // ---------------------------------------------------------------------------
 extern "C" __declspec(dllexport)
@@ -656,11 +699,7 @@ int luaopen_x4native(lua_State* L) {
 
     if (!g_initialized) {
         // --- First load (game start) ---
-        g_ext_root       = detect_ext_root();
-        g_core_path      = g_ext_root + "native\\x4native_core.dll";
-        g_core_live_path = g_ext_root + "native\\x4native_core_live.dll";
-
-        if (!load_core())
+        if (!first_load_guarded())
             return x4n::lua::L_error(L, "X4Native: failed to load core DLL");
 
         g_initialized = true;
@@ -675,25 +714,25 @@ int luaopen_x4native(lua_State* L) {
 
         // Hot-reload core if a newer build is on disk
         if (core_needs_reload())
-            reload_core();
+            reload_core_guarded();
     }
 
     // Build the Lua API table returned to x4native.lua
     x4n::lua::newtable(L);
 
     struct { const char* name; lua_CFunction fn; } funcs[] = {
-        { "discover_extensions",     l_discover_extensions     },
-        { "raise_event",             l_raise_event             },
-        { "raise_lua_event",         l_raise_lua_event         },
-        { "log",                     l_log                     },
-        { "get_version",             l_get_version             },
-        { "get_loaded_extensions",   l_get_loaded_extensions   },
-        { "reload",                  l_reload                  },
-        { "prepare_reload",          l_prepare_reload          },
-        { "get_extension_settings",  l_get_extension_settings  },
-        { "set_extension_setting",   l_set_extension_setting   },
+        { "discover_extensions",     lua_guarded<l_discover_extensions>    },
+        { "raise_event",             lua_guarded<l_raise_event>            },
+        { "raise_lua_event",         lua_guarded<l_raise_lua_event>        },
+        { "log",                     lua_guarded<l_log>                    },
+        { "get_version",             lua_guarded<l_get_version>            },
+        { "get_loaded_extensions",   lua_guarded<l_get_loaded_extensions>  },
+        { "reload",                  lua_guarded<l_reload>                 },
+        { "prepare_reload",          lua_guarded<l_prepare_reload>         },
+        { "get_extension_settings",  lua_guarded<l_get_extension_settings> },
+        { "set_extension_setting",   lua_guarded<l_set_extension_setting>  },
 #ifdef X4N_WITH_RELOAD
-        { "should_autoreload",       l_should_autoreload       },
+        { "should_autoreload",       lua_guarded<l_should_autoreload>      },
 #endif
     };
 

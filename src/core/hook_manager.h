@@ -52,6 +52,8 @@ struct HookedFunction {
     std::string                   name;
     void*                         target;       // Original function address
     void*                         trampoline;   // MinHook trampoline (calls original)
+    void*                         detour;       // Installed detour (code lives in the FIRST hooking extension's DLL)
+    HMODULE                       detour_module;// Module containing the detour code
     std::vector<HookCallbackInfo> before_hooks;
     std::vector<HookCallbackInfo> after_hooks;
 };
@@ -77,6 +79,12 @@ public:
 
     // Remove all hooks registered by a specific extension.
     static void remove_all_for_extension(const char* ext_name);
+
+    // Called before FreeLibrary on an extension module. If other extensions
+    // still dispatch through a detour whose code lives in the unloading DLL,
+    // pin that DLL in memory — unmapping it would leave the game's patched
+    // entry point jumping into freed memory.
+    static void protect_dangling_detours(HMODULE unloading_module);
 
     // Remove all hooks and uninitialize MinHook.
     static void remove_all();

@@ -112,6 +112,17 @@ sequenceDiagram
     end
 ```
 
+## Safe Mode (game build mismatch)
+
+At init, the core compares the game's detected build (`version.dat`, e.g. `900`) against the build its headers were generated from (`X4_GAME_TYPES_BUILD`). On mismatch — typically a major game update before X4Native has been rebuilt — the core enters **safe mode**:
+
+- The internal-function RVA database is not loaded; `resolve_offset_pointers` is skipped (all `X4GameOffsets` pointers stay null, so SDK helpers fail their existing null-guards instead of reading wrong memory).
+- The three core hooks (frame tick, radar, MD dispatch) are not installed — `on_native_frame_update`, `x4n::md::*`, and `on_radar_changed` never fire.
+- Name-resolved exported game functions (`api->game`, `get_game_function`) remain fully available.
+- A prominent error is logged at startup.
+
+Within a matching major build, intra-version patches are guarded per-function instead: each RVA in `internal_functions.json` that carries a `byte_sig` is verified against the live binary at load, and a mismatch disables just that function (with a warning) rather than hooking a stale address.
+
 ## DLL Pinning
 
 The proxy pins itself in `DllMain(DLL_PROCESS_ATTACH)` using `GET_MODULE_HANDLE_EX_FLAG_PIN`. This prevents LuaJIT's `FreeLibrary` (during `lua_close` on save load) from unloading the proxy.
@@ -193,6 +204,9 @@ sequenceDiagram
 | Core DLL | **Yes** — copy-on-load | No |
 | Proxy DLL | No — file locked | Yes (rarely changes) |
 | Stash data | **Persists** across reload | No |
+| Extension DLL | Yes (per-extension `autoreload`) — **unless it owns a shared detour** (see below) | Only in the shared-detour case |
+
+**Shared-detour limitation:** when two extensions hook the same game function, the installed detour code lives in whichever extension hooked it first. If that extension unloads (e.g. autoreload) while the other still has callbacks, the framework **pins the unloading DLL in memory** instead of freeing it — unmapping live detour code would crash the game on the next hooked call. The pin is logged as a warning; the pinned DLL stays mapped until game exit, and hot-reloading that extension fails until the other extensions release their hooks. A survivor re-install (transferring the detour to a still-loaded extension) requires an ABI addition and is planned.
 
 ## Proxy DLL
 

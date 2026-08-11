@@ -6,6 +6,9 @@
 #include "settings_manager.h"
 #include "x4native_defs.h"
 
+#include "common/platform.h"
+#include "common/winfile_shim.h"
+
 #include <x4_game_types.h>
 #include <x4_game_func_table.h>
 #include <x4_game_offsets.h>
@@ -113,7 +116,7 @@ void ExtensionManager::discover() {
         if (!fs::exists(config_path)) continue;
 
         ExtensionInfo info;
-        info.path = entry.path().string() + "\\";
+        info.path = entry.path().string() + "/";
 
         if (parse_config(config_path.string(), info)) {
             // Identity comes from content.xml — X4 enforces id uniqueness.
@@ -202,6 +205,17 @@ bool ExtensionManager::parse_config(const std::string& json_path, ExtensionInfo&
 
     std::string dll_rel = cfg["library"].get<std::string>();
     info.dll_path = info.path + dll_rel;
+
+#ifndef _WIN32
+    // On Linux the compiled extension is a .so, not a .dll. The x4native.json
+    // shipped by Windows authors still says "x4native.dll"; rewrite the suffix
+    // so dlopen() finds the ELF shared object. (Authors may also ship a
+    // linux-specific "library" value; we only rewrite a trailing .dll.)
+    if (info.dll_path.size() >= 4 &&
+        info.dll_path.compare(info.dll_path.size() - 4, 4, ".dll") == 0) {
+        info.dll_path.replace(info.dll_path.size() - 4, 4, ".so");
+    }
+#endif
 
     // Optional: legacy "name" field. Identity now comes from content.xml.
     // Stored so we can log a deprecation warning once the logger is open.
@@ -372,29 +386,53 @@ void ExtensionManager::load_all() {
                                    [](const ExtensionInfo& e) { return e.autoreload && e.initialized; }));
 }
 
-// SEH wrappers — must be in separate functions (no C++ objects requiring unwinding)
+// Guard wrappers — must be in separate functions (no C++ objects requiring unwinding)
 static int seh_call_api_version(ExtensionInfo::api_version_fn fn) {
+#ifdef _WIN32
     __try {
         return fn();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+#else
+    try {
+        return fn();
+    } catch (...) {
+        return -1;
+    }
+#endif
 }
 
 static int seh_call_init(ExtensionInfo::init_fn fn, X4NativeAPI* api) {
+#ifdef _WIN32
     __try {
         return fn(api);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+#else
+    try {
+        return fn(api);
+    } catch (...) {
+        return -1;
+    }
+#endif
 }
 
 static void seh_call_shutdown(ExtensionInfo::shutdown_fn fn) {
+#ifdef _WIN32
     __try {
         fn();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // logged by caller
     }
+#else
+    try {
+        fn();
+    } catch (...) {
+        // logged by caller
+    }
+#endif
 }
 
 ExtensionManager::LoadResult ExtensionManager::load_extension(ExtensionInfo& ext) {
@@ -425,36 +463,36 @@ ExtensionManager::LoadResult ExtensionManager::load_extension(ExtensionInfo& ext
     // while the game is running. The live copy is what gets LoadLibrary'd.
     fs::path src(ext.dll_path);
     ext.dll_live_path = (src.parent_path() / (src.stem().string() + "_live" + src.extension().string())).string();
-    if (!CopyFileA(ext.dll_path.c_str(), ext.dll_live_path.c_str(), FALSE)) {
-        Logger::error("Extension '{}': CopyFile failed (error={})", ext.display_name, GetLastError());
+    if (!copy_file(ext.dll_path.c_str(), ext.dll_live_path.c_str())) {
+        Logger::error("Extension '{}': CopyFile failed (error={})", ext.display_name, last_error());
         return LoadResult::failed;
     }
 
     // Snapshot the original DLL's mtime so tick() can detect future changes
     WIN32_FILE_ATTRIBUTE_DATA mtime_attr = {};
-    if (GetFileAttributesExA(ext.dll_path.c_str(), GetFileExInfoStandard, &mtime_attr))
+    if (get_file_attributes_ex(ext.dll_path.c_str(), nullptr, &mtime_attr))
         ext.dll_mtime = mtime_attr.ftLastWriteTime;
 
-    ext.module = LoadLibraryA(ext.dll_live_path.c_str());
+    ext.module = load_library(ext.dll_live_path.c_str());
     if (!ext.module) {
         Logger::error("Extension '{}': LoadLibrary failed (error={})",
-                      ext.display_name, GetLastError());
-        DeleteFileA(ext.dll_live_path.c_str());
+                      ext.display_name, last_error());
+        delete_file(ext.dll_live_path.c_str());
         return LoadResult::failed;
     }
 
     // Resolve required exports
     ext.fn_api_version = reinterpret_cast<ExtensionInfo::api_version_fn>(
-        GetProcAddress(ext.module, "x4native_api_version"));
+        get_proc_address(ext.module, "x4native_api_version"));
     ext.fn_init = reinterpret_cast<ExtensionInfo::init_fn>(
-        GetProcAddress(ext.module, "x4native_init"));
+        get_proc_address(ext.module, "x4native_init"));
     ext.fn_shutdown = reinterpret_cast<ExtensionInfo::shutdown_fn>(
-        GetProcAddress(ext.module, "x4native_shutdown"));
+        get_proc_address(ext.module, "x4native_shutdown"));
 
     auto unload_live = [&] {
-        FreeLibrary(ext.module);
+        free_library(ext.module);
         ext.module = nullptr;
-        DeleteFileA(ext.dll_live_path.c_str());
+        delete_file(ext.dll_live_path.c_str());
         ext.dll_live_path.clear();
         // Close per-extension log if it was already opened (log open happens after this
         // lambda is defined, but ext.log_handle starts as INVALID_HANDLE_VALUE so early
@@ -565,11 +603,11 @@ void ExtensionManager::unload_extension(ExtensionInfo& ext) {
     // this DLL, pin it so FreeLibrary can't unmap live hook code.
     HookManager::protect_dangling_detours(ext.module);
     if (ext.module) {
-        FreeLibrary(ext.module);
+        free_library(ext.module);
         ext.module = nullptr;
     }
     if (!ext.dll_live_path.empty()) {
-        DeleteFileA(ext.dll_live_path.c_str());
+        delete_file(ext.dll_live_path.c_str());
         ext.dll_live_path.clear();
     }
     // Close per-extension log (after shutdown so the extension can log until the end)
@@ -599,9 +637,9 @@ void ExtensionManager::tick() {
         if (!ext.autoreload || !ext.initialized || ext.reload_pending) continue;
 
         WIN32_FILE_ATTRIBUTE_DATA attr = {};
-        if (!GetFileAttributesExA(ext.dll_path.c_str(), GetFileExInfoStandard, &attr)) continue;
+        if (!get_file_attributes_ex(ext.dll_path.c_str(), nullptr, &attr)) continue;
 
-        if (CompareFileTime(&attr.ftLastWriteTime, &ext.dll_mtime) > 0) {
+        if (compare_file_time(&attr.ftLastWriteTime, &ext.dll_mtime) > 0) {
             Logger::info("Extension '{}': DLL changed on disk, queuing hot-reload",
                          ext.display_name);
             ext.reload_pending = true;

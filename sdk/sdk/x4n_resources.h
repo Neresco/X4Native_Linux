@@ -25,7 +25,6 @@
 
 #include "x4n_core.h"
 #include "x4n_entity.h"
-#include "platform.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -49,7 +48,7 @@ struct SectorResource {
 };
 
 // ---------------------------------------------------------------------------
-// Implementation detail — guarded collection (no std::string destructors in probe).
+// Implementation detail — SEH requires POD types (no std::string destructors).
 // ---------------------------------------------------------------------------
 namespace detail {
 
@@ -64,7 +63,7 @@ struct RawAreaRef {
     const X4ResourceArea*   ra;
 };
 
-/// Guarded collection. Returns count of ware entries in accum_buf.
+/// SEH-guarded collection. Returns count of ware entries in accum_buf.
 inline uint32_t collect_raw(
     UniverseID sector_id,
     RawAccum* accum_buf, uint32_t max_wares,
@@ -73,7 +72,7 @@ inline uint32_t collect_raw(
     *area_count = 0;
     if (!accum_buf || max_wares == 0) return 0;
 
-    X4N_TRY {
+    __try {
         auto* sector = entity::find_component(sector_id);
         if (!sector) return 0;
         if (!entity::is_a(sector, x4n::GameClass::Sector)) return 0;
@@ -120,7 +119,8 @@ inline uint32_t collect_raw(
         }
         *area_count = acount;
         return wcount;
-    } X4N_EXCEPT() {
+    }
+    __except (1) {
         return 0;
     }
 }

@@ -10,7 +10,11 @@
 #include "logger.h"
 #include "game_api.h"
 
+#ifdef _WIN32
 #include <MinHook.h>
+#else
+#include "common/minhook_shim.h"
+#endif
 #include <algorithm>
 
 namespace x4n {
@@ -257,9 +261,11 @@ void* HookManager::ensure_detour(const char* function_name, void* detour_fn) {
     // template instantiation). Remember which module that is so unload can
     // detect when other extensions still route through it.
     hf->detour_module = nullptr;
+#ifdef _WIN32
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        static_cast<LPCSTR>(detour_fn), &hf->detour_module);
+#endif
     Logger::info("HookManager: detour installed for '{}'", function_name);
     return trampoline;
 }
@@ -268,6 +274,7 @@ void HookManager::protect_dangling_detours(HMODULE unloading_module) {
     std::lock_guard lock(s_mutex);
     if (!s_initialized || !unloading_module) return;
 
+#ifdef _WIN32
     for (auto& [name, hf] : s_hooks) {
         if (hf.detour_module != unloading_module) continue;
         if (hf.before_hooks.empty() && hf.after_hooks.empty()) continue;
@@ -286,19 +293,33 @@ void HookManager::protect_dangling_detours(HMODULE unloading_module) {
                      "prevent a crash. Hot-reloading this extension will fail until "
                      "the other extensions release their hooks.", name);
     }
+#else
+    // On Linux no detours are installed (see minhook_shim), so there is nothing
+    // to protect. This is a no-op.
+    (void)unloading_module;
+#endif
 }
 
 // ---------------------------------------------------------------------------
 // Dispatch — called by typed detours generated in x4native.h
 // ---------------------------------------------------------------------------
 
-// SEH wrapper — must be a separate function (no C++ objects needing unwind)
+// Callback invocation wrapper.
+// On Windows this is an SEH __try/__except guard that also catches hardware
+// faults (access violations inside an extension). On Linux, GCC/Clang do not
+// support SEH, so we fall back to a plain call. A crashing extension will take
+// the game down — extension authors must ensure their hooks are safe. (A
+// sigsetjmp-based guard could be added later if needed.)
 static int seh_call_hook(X4HookCallback callback, X4HookContext* ctx) {
+#ifdef _WIN32
     __try {
         return callback(ctx);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+#else
+    return callback(ctx);
+#endif
 }
 
 void HookManager::run_before_hooks(X4HookContext* ctx) {

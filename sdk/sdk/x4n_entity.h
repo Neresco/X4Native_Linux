@@ -5,7 +5,7 @@
 //
 // Provides:
 //   x4n::entity::find_component()      — resolve UniverseID to X4Component*
-//   x4n::entity::resolve_entity()      — guarded raw pointer validation
+//   x4n::entity::resolve_entity()      — SEH-guarded raw pointer validation
 //   x4n::entity::get_component_macro() — macro name (heavy components only)
 //   x4n::entity::get_spawntime()       — Container-class spawntime
 //
@@ -19,7 +19,6 @@
 #pragma once
 
 #include "x4n_core.h"
-#include "platform.h"
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -70,15 +69,15 @@ inline const char* get_class_name(uint64_t id) {
 
 /// Resolve a raw uint64_t (from MD event fields) to a typed X4EntityBase*.
 /// MD event params often contain raw component pointers stored as uint64_t.
-/// Guarded: validates the pointer is readable by probing ->id.
+/// SEH-guarded: validates the pointer is readable by probing ->id.
 /// Returns nullptr if the value is null or not a valid entity pointer.
 inline X4EntityBase* resolve_entity(uint64_t raw_ptr) {
     if (raw_ptr == 0) return nullptr;
-    X4N_TRY {
+    __try {
         auto* ent = reinterpret_cast<X4EntityBase*>(raw_ptr);
-        (void)ent->id;  // probe — triggers guard if invalid
+        (void)ent->id;  // probe — triggers SEH if invalid
         return ent;
-    } X4N_EXCEPT() {
+    } __except(1) {
         return nullptr;
     }
 }
@@ -97,7 +96,7 @@ inline const char* get_component_macro(X4Component* component) {
     if (!component || !component->definition.vtable) return nullptr;
     auto* str = reinterpret_cast<uint64_t*>(component->definition.GetMacroName());
     if (!str) return nullptr;
-    // MSVC x64 std::string SSO: data inline at str[0..2] if capacity (str[3]) < 16.
+    // MSVC x64 std::string SSO: data inline at str[0..1] if capacity (str[3]) < 16.
     return (str[3] < 16)
         ? reinterpret_cast<const char*>(str)
         : reinterpret_cast<const char*>(str[0]);
@@ -184,6 +183,26 @@ inline UniverseID find_ancestor(UniverseID id, GameClass cls) {
 // Lua caller (`grep "GetComponentData.*\"<field>\"" reference/game/ui`) before
 // adding a typed SDK helper for it. For MD-only fields, route through MD
 // using a `raise_lua_event` round-trip and cache the result.
+//
+// Why MD-only properties can't be reached without the MD bridge — the engine
+// has two distinct property dispatchers:
+//
+// 1. Lua C-function dispatcher (`LuaGlobal_GetComponentData`) — FNV-1 hash
+//    table over a SUBSET of property names. Many properties (e.g.
+//    `buildresourcevalue`) are NOT in this table; `GetComponentData` returns
+//    nil for them. This is the dispatcher `get_field_int` calls below.
+//
+// 2. MD VM dispatcher — uses VIRTUAL dispatch via vtable[+0x11C8 / +0x11D0]
+//    (slots 569 / 570). Each entity class implements its own value-walker;
+//    there is no single FFI-able entry. Direct call would require building
+//    internal PropertyIterator structs + tagged-variant decoding, and is
+//    version-fragile across patches.
+//
+// Practical rule: if a property has zero vanilla `GetComponentData(...)`
+// callers in `reference/game/ui/`, it is MD-VM-only. Route it through MD
+// (cycle-burst MD cue → raise_lua_event → DLL cache); do NOT attempt direct
+// FFI exposure. See `X4Native/docs/rev/SUBSYSTEMS.md` §12 for the full
+// dual-dispatcher analysis.
 
 namespace detail_entity {
     inline X4nLuaKey key(UniverseID id) {

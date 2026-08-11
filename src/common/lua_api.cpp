@@ -1,9 +1,9 @@
 #include "lua_api.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "common/platform.h"
+
+#include <string>
+#include <cstdlib>
 
 namespace x4n { namespace lua {
 
@@ -69,14 +69,30 @@ bool resolve() {
     static bool s_resolved = false;
     if (s_resolved) return true;
 
-    // X4 ships LuaJIT 2.1.0-beta3 as lua51_64.dll in the game root.
-    // X4.exe does NOT export any Lua symbols — they're all in this DLL.
-    HMODULE h = GetModuleHandleA("lua51_64.dll");
-    if (!h) h = GetModuleHandleA("lua51.dll");    // fallback
+    // X4 ships LuaJIT 2.1.0-beta3. On Windows the symbols live in
+    // lua51_64.dll; on Linux they live in libluajit-5.1.so.2 (shipped in
+    // the game's lib/ directory). We resolve against that module, falling
+    // back to the global symbol table (RTLD_DEFAULT) which covers the case
+    // where the library is already loaded into the process image.
+    HMODULE h = get_module_handle();
+#ifdef _WIN32
+    h = GetModuleHandleA("lua51_64.dll");
+    if (!h) h = GetModuleHandleA("lua51.dll");
+#else
+    const char* lib = std::getenv("X4_LUA_LIB");
+    std::string lib_path;
+    if (!lib || !lib[0]) {
+        const char* root = std::getenv("X4_GAME_ROOT");
+        lib_path = std::string(root && root[0] ? root : "./") + "lib/libluajit-5.1.so.2";
+        lib = lib_path.c_str();
+    }
+    HMODULE loaded = load_library(lib);
+    if (loaded) h = loaded;  // prefer the explicit module; nullptr -> RTLD_DEFAULT
+#endif
     if (!h) return false;
 
 #define RESOLVE(ptr, sym)                                                     \
-    ptr = reinterpret_cast<decltype(ptr)>(GetProcAddress(h, sym));            \
+    ptr = reinterpret_cast<decltype(ptr)>(get_proc_address(h, sym));          \
     if (!ptr) return false
 
     RESOLVE(gettop,           "lua_gettop");

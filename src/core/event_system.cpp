@@ -1,27 +1,33 @@
 #include "event_system.h"
 #include "logger.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "common/platform.h"
 
 #include <algorithm>
 
 namespace x4n {
 
-// SEH wrapper — must be a separate function (no C++ objects needing unwind).
+// Guard wrapper — must be a separate function (no C++ objects needing unwind).
 // Mirrors seh_call_hook in hook_manager.cpp: a faulting subscriber must not
 // take down the game from the event dispatch path (which includes the
 // per-frame on_native_frame_update and the engine's MD dispatch hot path).
 static int seh_call_event(EventCallback cb, const char* event_name,
                           void* data, void* userdata) {
+#ifdef _WIN32
     __try {
         cb(event_name, data, userdata);
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+#else
+    try {
+        cb(event_name, data, userdata);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+#endif
 }
 
 std::unordered_map<std::string, std::vector<EventSystem::Subscription>>

@@ -15,10 +15,15 @@
 #include <x4_game_func_table.h>
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include "common/windows_shim.h"
+#include <cstdint>
+#endif
 
 #include <cstddef>
 #include <cstring>
@@ -57,7 +62,11 @@ static const FuncEntry s_ifunc_entries[] = {
 };
 #undef X4_FUNC
 
+#ifdef _WIN32
 static HMODULE s_x4_module = nullptr;
+#else
+static void*   s_x4_module = nullptr;
+#endif
 static int     s_resolved  = 0;
 
 // ---------------------------------------------------------------------------
@@ -65,10 +74,18 @@ static int     s_resolved  = 0;
 // ---------------------------------------------------------------------------
 
 bool GameAPI::init() {
-    // X4.exe is the host process — GetModuleHandle(NULL) gets its handle
+    // X4 is the host process. On Windows we use GetModuleHandle(NULL); on Linux
+    // we open the main executable's global symbol table via dlopen(NULL). This
+    // only yields symbols the binary actually exports (X4's no-Steam binary
+    // exports very few, so most get_function() lookups will fail — which is
+    // expected; hooks are disabled on Linux anyway, see minhook_shim).
+#ifdef _WIN32
     s_x4_module = GetModuleHandleA(nullptr);
+#else
+    s_x4_module = dlopen(nullptr, RTLD_LAZY | RTLD_GLOBAL);
+#endif
     if (!s_x4_module) {
-        Logger::error("GameAPI: Failed to get X4.exe module handle");
+        Logger::error("GameAPI: Failed to get X4 module handle");
         return false;
     }
 
@@ -77,10 +94,13 @@ bool GameAPI::init() {
 
     auto* base = reinterpret_cast<char*>(&s_table);
     for (const auto& entry : s_func_entries) {
+#ifdef _WIN32
         FARPROC proc = GetProcAddress(s_x4_module, entry.name);
+#else
+        void* proc = dlsym(s_x4_module, entry.name);
+#endif
         if (proc) {
-            *reinterpret_cast<void**>(base + entry.offset) =
-                reinterpret_cast<void*>(proc);
+            *reinterpret_cast<void**>(base + entry.offset) = proc;
             s_resolved++;
         }
     }
@@ -114,7 +134,11 @@ X4GameFunctions* GameAPI::table() {
 
 void* GameAPI::get_function(const char* name) {
     if (!s_x4_module || !name) return nullptr;
+#ifdef _WIN32
     return reinterpret_cast<void*>(GetProcAddress(s_x4_module, name));
+#else
+    return dlsym(s_x4_module, name);
+#endif
 }
 
 void* GameAPI::get_internal(const char* name) {
@@ -125,7 +149,14 @@ void* GameAPI::get_internal(const char* name) {
 }
 
 uintptr_t GameAPI::exe_base() {
+#ifdef _WIN32
     return reinterpret_cast<uintptr_t>(s_x4_module);
+#else
+    // On Linux the "base" is not meaningful from a dlopen handle; return 0.
+    // Internal RVA resolution is disabled on Linux (no exported symbols), so
+    // this is only used as a fallback and is safe to be 0.
+    return 0;
+#endif
 }
 
 // Parse a "48 8B ?? C4" style signature into byte + mask vectors.
@@ -160,10 +191,15 @@ static bool parse_byte_sig(const std::string& sig,
     return !bytes.empty();
 }
 
-// SEH-guarded signature compare — separate function, no C++ objects.
-// Returns 1 on match, 0 on mismatch, -1 if the address is unreadable.
+// Signature compare against live binary memory.
+// On Windows this is SEH-guarded so an unmapped/unreadable address returns -1
+// instead of crashing. On Linux, GCC/Clang lack SEH; we do a plain read. A
+// truly unmapped page would SIGSEGV — acceptable for this PoC, and internal
+// RVA resolution is disabled on Linux anyway (see exe_base / load_internal_db
+// guard below). Returns 1 on match, 0 on mismatch.
 static int seh_sig_match(const uint8_t* addr, const uint8_t* bytes,
                          const uint8_t* mask, size_t n) {
+#ifdef _WIN32
     __try {
         for (size_t i = 0; i < n; ++i)
             if (mask[i] && addr[i] != bytes[i]) return 0;
@@ -171,10 +207,26 @@ static int seh_sig_match(const uint8_t* addr, const uint8_t* bytes,
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+#else
+    for (size_t i = 0; i < n; ++i)
+        if (mask[i] && addr[i] != bytes[i]) return 0;
+    return 1;
+#endif
 }
 
 void GameAPI::load_internal_db(const std::string& ext_root,
                                const std::string& build_label) {
+#ifndef _WIN32
+    // Internal RVA resolution requires reading the game binary at absolute
+    // addresses derived from the module base. On Linux the no-Steam binary
+    // does not export its symbol table, so the base is 0 and any RVA deref
+    // would be an invalid low-address read. Frame-tick / MD / radar hooks are
+    // therefore disabled on Linux (they are also disabled by the MinHook
+    // shim). Skip the DB entirely.
+    Logger::warn("GameAPI: internal RVA database is DISABLED on Linux "
+                 "(no exported symbol base). Frame/MD/radar hooks unavailable.");
+    return;
+#endif
     std::string db_path = ext_root + "native/version_db/internal_functions.json";
     std::ifstream file(db_path);
     if (!file.is_open()) {

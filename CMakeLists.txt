@@ -1,116 +1,117 @@
-cmake_minimum_required(VERSION 3.20)
-project(x4native VERSION 0.9.0)
-
 # ---------------------------------------------------------------------------
-# Configuration
+# CMakeLists.txt — X4Native Linux build (port of the Windows extension)
+#
+# Produces two shared objects consumed by the X4 Foundations Linux client:
+#   libx4native_64.so    — thin proxy (stable ABI, loaded by the game)
+#   libx4native_core.so  — hot-reloadable framework core
+#
+# Build:
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build
+#   # outputs land in native/ (libx4native_64.so, libx4native_core.so)
+#
+# Differences from the Windows build:
+#   * No MinHook — Linux uses a built-in mprotect-based inline detour
+#     (see core/hook_manager.cpp, HookProvider::linux_detour).
+#   * SEH (__try/__except) replaced by POSIX sigsetjmp/siglongjmp guards
+#     (see common/platform.h, X4N_TRY / X4N_EXCEPT).
+#   * Windows Version API replaced by a readlink(/proc/self/exe) implementation.
+#   * Lua symbols resolved from libluajit-5.1.so.2 shipped with the game.
 # ---------------------------------------------------------------------------
-# X4_GAME_DIR resolution order:
-#   1. Explicit -DX4_GAME_DIR=<path> or CMakeUserPresets.json
-#   2. Auto-detect from Steam registry + verify X4 is installed there
-set(X4_GAME_DIR "" CACHE PATH "X4 Foundations installation directory")
+cmake_minimum_required(VERSION 3.16)
+project(x4native VERSION 9.0.0 LANGUAGES CXX)
 
-if(NOT X4_GAME_DIR AND WIN32)
-    # Read Steam's install path from the registry
-    get_filename_component(_STEAM_DIR
-        "[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Valve\\Steam;InstallPath]"
-        ABSOLUTE CACHE)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-    if(_STEAM_DIR AND EXISTS "${_STEAM_DIR}")
-        set(_X4_CANDIDATE "${_STEAM_DIR}/steamapps/common/X4 Foundations")
-        if(EXISTS "${_X4_CANDIDATE}/X4.exe")
-            set(X4_GAME_DIR "${_X4_CANDIDATE}" CACHE PATH
-                "X4 Foundations installation directory (auto-detected)" FORCE)
-            message(STATUS "Auto-detected X4 at: ${X4_GAME_DIR}")
-        endif()
-    endif()
-    unset(_STEAM_DIR CACHE)
-    unset(_X4_CANDIDATE)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "This port targets Linux only.")
 endif()
 
-if(NOT X4_GAME_DIR)
-    message(WARNING "X4_GAME_DIR not set and auto-detect failed.\n"
-                    "Deploy target will be unavailable.\n"
-                    "Pass -DX4_GAME_DIR=<path> or create CMakeUserPresets.json")
-endif()
+# ---------------------------------------------------------------------------
+# Feature flags
+# ---------------------------------------------------------------------------
+option(X4N_WITH_RELOAD "Compile in core hot-reload support (proxy)" OFF)
 
-set(DEPLOY_DIR "${X4_GAME_DIR}/extensions/x4native")
+# Output shared objects directly into native/ so the game's loader finds them.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native")
 
 # ---------------------------------------------------------------------------
-# Game version — parsed from sdk/x4_game_types.h (single source of truth)
+# Dependencies — nlohmann/json is vendored locally (third_party/nlohmann).
+# This avoids a network fetch at configure time.
 # ---------------------------------------------------------------------------
-file(STRINGS "${CMAKE_SOURCE_DIR}/sdk/x4_game_types.h" _build_line
-     REGEX "^#define X4_GAME_TYPES_BUILD [0-9]+$")
-string(REGEX REPLACE "^#define X4_GAME_TYPES_BUILD ([0-9]+)$" "\\1" X4_GAME_TYPES_BUILD "${_build_line}")
-message(STATUS "X4_GAME_TYPES_BUILD: ${X4_GAME_TYPES_BUILD}")
+set(NLOHMANN_JSON_INCLUDE "${CMAKE_SOURCE_DIR}/third_party")
 
-# Generate content.xml from template with correct game version
-configure_file(
-    "${CMAKE_SOURCE_DIR}/extension/content.xml.in"
-    "${CMAKE_SOURCE_DIR}/extension/content.xml"
-    @ONLY
+# ---------------------------------------------------------------------------
+# Proxy .so — thin, stable
+# ---------------------------------------------------------------------------
+add_library(x4native_64 SHARED
+    src/proxy/proxy.cpp
+    src/common/lua_api.cpp
+)
+
+target_compile_definitions(x4native_64 PRIVATE
+    X4N_PLATFORM_LINUX
+    $<$<BOOL:${X4N_WITH_RELOAD}>:X4N_WITH_RELOAD=1>
+)
+
+target_include_directories(x4native_64 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/sdk
+    ${CMAKE_SOURCE_DIR}/sdk/sdk
+    ${NLOHMANN_JSON_INCLUDE}
+)
+
+set_target_properties(x4native_64 PROPERTIES
+    PREFIX "lib"
+    OUTPUT_NAME "x4native_64"
+    SUFFIX ".so"
 )
 
 # ---------------------------------------------------------------------------
-# DLL build (Phase 1+, when src/ exists)
+# Core .so — hot-reloadable framework logic
 # ---------------------------------------------------------------------------
-if(EXISTS "${CMAKE_SOURCE_DIR}/src/CMakeLists.txt")
-    enable_language(CXX)
-    add_subdirectory(src)
-else()
-    message(STATUS "src/ not found — skipping DLL build (extension-files-only deploy)")
-endif()
+add_library(x4native_core SHARED
+    src/core/core.cpp
+    src/core/logger.cpp
+    src/core/event_system.cpp
+    src/core/extension_manager.cpp
+    src/core/game_api.cpp
+    src/core/hook_manager.cpp
+    src/core/settings_manager.cpp
+    src/core/version.cpp
+    src/common/winfile_shim.cpp
+    src/common/minhook_shim.cpp
+    src/common/platform_impl.cpp
+)
+
+target_compile_definitions(x4native_core PRIVATE X4N_PLATFORM_LINUX)
+
+target_include_directories(x4native_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/sdk
+    ${CMAKE_SOURCE_DIR}/sdk/sdk
+    ${NLOHMANN_JSON_INCLUDE}
+)
+
+target_link_libraries(x4native_core PRIVATE
+    ${CMAKE_DL_LIBS}   # dlopen / dlsym / dlerror
+)
+
+set_target_properties(x4native_core PROPERTIES
+    PREFIX "lib"
+    OUTPUT_NAME "x4native_core"
+    SUFFIX ".so"
+)
 
 # ---------------------------------------------------------------------------
-# Install rules — these define WHAT gets deployed
+# Install rules — targets go into native/
 # ---------------------------------------------------------------------------
-# Extension folder — deploy everything except settings (user-editable)
-install(DIRECTORY extension/ DESTINATION .
-    PATTERN "x4native_settings.json" EXCLUDE
-    PATTERN "content.xml.in" EXCLUDE)
-
-# Framework settings — only deploy if not already present (preserves user edits)
-install(CODE "
-    set(_SETTINGS_DEST \"\${CMAKE_INSTALL_PREFIX}/x4native_settings.json\")
-    if(NOT EXISTS \"\${_SETTINGS_DEST}\")
-        file(INSTALL \"${CMAKE_SOURCE_DIR}/extension/x4native_settings.json\"
-             DESTINATION \"\${CMAKE_INSTALL_PREFIX}\")
-    else()
-        message(STATUS \"Skipping x4native_settings.json (already exists)\")
-    endif()
-")
-
-# DLL targets are installed by src/CMakeLists.txt.
-# version_db/ — internal function RVA database (needed at runtime for hook resolution)
-install(DIRECTORY native/version_db/ DESTINATION native/version_db)
-
-# SDK headers (for extension developers — opt-in, not included in player/Workshop releases)
-option(INSTALL_SDK "Install SDK headers alongside the extension" ON)
-if(INSTALL_SDK)
-    install(DIRECTORY sdk/ DESTINATION sdk)
-endif()
-
-# ---------------------------------------------------------------------------
-# deploy target — single command: cmake --build build --target deploy
-# ---------------------------------------------------------------------------
-if(X4_GAME_DIR)
-    add_custom_target(deploy
-        COMMAND ${CMAKE_COMMAND} -E echo "Deploying x4native to ${DEPLOY_DIR}"
-        COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR}
-                --prefix "${DEPLOY_DIR}"
-                --config $<CONFIG>
-        COMMENT "Deploy x4native extension"
-    )
-
-    # If DLL targets exist, make deploy depend on them so they build first
-    if(TARGET x4native_64)
-        add_dependencies(deploy x4native_64)
-    endif()
-    if(TARGET x4native_core)
-        add_dependencies(deploy x4native_core)
-    endif()
-else()
-    add_custom_target(deploy
-        COMMAND ${CMAKE_COMMAND} -E echo "ERROR: X4_GAME_DIR is not set. Cannot deploy."
-        COMMAND ${CMAKE_COMMAND} -E false
-    )
-endif()
+install(TARGETS x4native_64 x4native_core
+    LIBRARY DESTINATION native
+)

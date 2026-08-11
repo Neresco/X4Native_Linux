@@ -1,12 +1,5 @@
 // ---------------------------------------------------------------------------
-// x4native_core.dll — Core Entry Point
-//
-// This is the hot-reloadable core. All framework logic lives here:
-// logger, event system, version detection, extension management (Phase 2+).
-//
-// The proxy DLL loads this via copy-on-load and calls core_init() to fill
-// the dispatch table. On hot-reload, the proxy FreeLibrary's the old core,
-// copies the new build, LoadLibrary's it, and calls core_init() again.
+// x4native_core.so — Core Entry Point (Linux)
 // ---------------------------------------------------------------------------
 
 #include "logger.h"
@@ -21,26 +14,23 @@
 #include <x4_game_func_table.h>
 #include <x4_game_offsets.h>
 #include <x4_manual_types.h>
+#ifdef _WIN32
 #include <MinHook.h>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#else
+#include "common/minhook_shim.h"
 #endif
-#include <windows.h>
 
 #include <array>
 #include <cstdio>
 #include <string>
 #include <cmath>
+#include <csignal>
+#include <dlfcn.h>
 
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
-// Runtime-resolved game offsets (extern'd by extension_manager.cpp).
-// Integer fields are statically initialized from #defines.
-// Pointer fields (needing exe_base) are filled by populate_offsets() at startup.
 X4GameOffsets s_offsets = {
-    // --- Pre-resolved pointers: nullptr until populate_offsets() ---
     .frame_game_time       = nullptr,
     .frame_raw_time        = nullptr,
     .frame_real_time       = nullptr,
@@ -53,7 +43,6 @@ X4GameOffsets s_offsets = {
     .macro_registry        = nullptr,
     .radar_event_vtable    = nullptr,
 
-    // --- Vtable slot indices (pre-divided by 8) ---
     .vtable_get_class_type   = X4_VTABLE_GET_CLASS_TYPE / 8,
     .vtable_get_class_id     = X4_VTABLE_GET_CLASS_ID / 8,
     .vtable_is_class_id      = X4_VTABLE_IS_CLASS_ID / 8,
@@ -64,12 +53,10 @@ X4GameOffsets s_offsets = {
     .vtable_destroy          = X4_VTABLE_DESTROY / 8,
     .vtable_get_faction_id   = X4_VTABLE_GET_FACTION_ID / 8,
 
-    // --- Engine context offsets ---
     .enginectx_frame_counter = X4_ENGINECTX_OFFSET_FRAME_COUNTER,
     .enginectx_fps_timer     = X4_ENGINECTX_OFFSET_FPS_TIMER,
     .enginectx_fps           = X4_ENGINECTX_OFFSET_FPS,
 
-    // --- Component struct offsets ---
     .component_id            = X4_COMPONENT_OFFSET_ID,
     .component_definition    = X4_COMPONENT_OFFSET_DEFINITION,
     .component_parent        = X4_COMPONENT_OFFSET_PARENT,
@@ -77,13 +64,11 @@ X4GameOffsets s_offsets = {
     .component_exists        = X4_COMPONENT_OFFSET_EXISTS,
     .component_combined_seed = X4_COMPONENT_OFFSET_COMBINED_SEED,
 
-    // --- Container / Space / Universe ---
     .container_spawntime         = X4_CONTAINER_OFFSET_SPAWNTIME,
     .space_has_sunlight          = X4_SPACE_OFFSET_HAS_SUNLIGHT,
     .space_sunlight              = X4_SPACE_OFFSET_SUNLIGHT,
     .game_universe_galaxy_offset = X4_GAME_UNIVERSE_GALAXY_OFFSET,
 
-    // --- Object-class visibility ---
     .object_owner_faction_ptr    = X4_OBJECT_OFFSET_OWNER_FACTION_PTR,
     .object_known_read           = X4_OBJECT_OFFSET_KNOWN_READ,
     .object_known_to_all         = X4_OBJECT_OFFSET_KNOWN_TO_ALL,
@@ -96,7 +81,6 @@ X4GameOffsets s_offsets = {
     .object_radar_visible        = X4_OBJECT_OFFSET_RADAR_VISIBLE,
     .object_forced_radar_visible = X4_OBJECT_OFFSET_FORCED_RADAR_VISIBLE,
 
-    // --- Space-class visibility ---
     .space_owner_faction_ptr     = X4_SPACE_OFFSET_OWNER_FACTION_PTR,
     .space_known_read            = X4_SPACE_OFFSET_KNOWN_READ,
     .space_known_to_all          = X4_SPACE_OFFSET_KNOWN_TO_ALL,
@@ -104,11 +88,9 @@ X4GameOffsets s_offsets = {
     .space_known_factions_cap    = X4_SPACE_OFFSET_KNOWN_FACTIONS_CAP,
     .space_known_factions_count  = X4_SPACE_OFFSET_KNOWN_FACTIONS_COUNT,
 
-    // --- Sector resource areas ---
     .sector_resarea_vec_begin    = X4_SECTOR_RESAREA_VEC_BEGIN,
     .sector_resarea_vec_end      = X4_SECTOR_RESAREA_VEC_END,
 
-    // --- MacroData / ConnectionEntry ---
     .macrodata_connections_begin   = X4_MACRODATA_OFFSET_CONNECTIONS_BEGIN,
     .macrodata_connections_end     = X4_MACRODATA_OFFSET_CONNECTIONS_END,
     .connection_entry_size         = X4_CONNECTION_ENTRY_SIZE,
@@ -117,11 +99,9 @@ X4GameOffsets s_offsets = {
     .macrodefaults_room_conn_begin = X4_MACRODEFAULTS_OFFSET_ROOM_CONNECTIONS_BEGIN,
     .macrodefaults_room_conn_end   = X4_MACRODEFAULTS_OFFSET_ROOM_CONNECTIONS_END,
 
-    // --- Radar event layout ---
     .radar_event_entity_id = X4_RADAR_EVENT_OFFSET_ENTITY_ID,
     .radar_event_visible   = X4_RADAR_EVENT_OFFSET_VISIBLE,
 
-    // --- Room offsets ---
     .room_roomtype   = X4_ROOM_OFFSET_ROOMTYPE,
     .room_name       = X4_ROOM_OFFSET_NAME,
     .room_private    = X4_ROOM_OFFSET_PRIVATE,
@@ -130,24 +110,20 @@ X4GameOffsets s_offsets = {
 
 static std::string g_ext_root;
 static std::string g_game_version;
-static std::string g_version_string;        // cached for get_version()
-static raise_lua_event_fn g_raise_lua_event = nullptr;  // proxy-provided Lua bridge
-static register_lua_bridge_fn g_register_lua_bridge = nullptr;  // proxy-provided Lua→C++ bridge
+static std::string g_version_string;
+static raise_lua_event_fn g_raise_lua_event = nullptr;
+static register_lua_bridge_fn g_register_lua_bridge = nullptr;
 
-// Stash — proxy-owned in-memory key-value, forwarded from CoreInitContext
 static stash_set_fn    g_stash_set    = nullptr;
 static stash_get_fn    g_stash_get    = nullptr;
 static stash_remove_fn g_stash_remove = nullptr;
 static stash_clear_fn  g_stash_clear  = nullptr;
 
-// Lua-property accessors — proxy-implemented (proxy already has the resolved
-// Lua C-API table for proxy_raise_lua_event), forwarded into X4NativeAPI.
-// Externally linked so extension_manager.cpp::fill_api can install them.
 get_lua_property_fn     g_get_lua_property     = nullptr;
 get_lua_property_str_fn g_get_lua_property_str = nullptr;
 
 // ---------------------------------------------------------------------------
-// Resolve pointer fields in s_offsets (requires exe_base, called once at startup)
+// Resolve pointer fields in s_offsets
 // ---------------------------------------------------------------------------
 static void resolve_offset_pointers(uintptr_t base) {
     s_offsets.frame_game_time      = reinterpret_cast<double*>(base + X4_RVA_FRAME_GAME_TIME);
@@ -164,30 +140,22 @@ static void resolve_offset_pointers(uintptr_t base) {
 }
 
 // ---------------------------------------------------------------------------
-// Native frame tick hook — fires on_native_frame_update to extensions
+// Native frame tick hook
 // ---------------------------------------------------------------------------
-// Direct MinHook detour on the engine's internal frame tick function.
-// Reads timing data from known game globals (verified v9.00 build 900).
-// See docs/rev/GAME_LOOP.md for reverse engineering notes.
-
 static uintptr_t g_x4_base = 0;
 static void*     g_frame_tick_trampoline = nullptr;
 
-using FrameTickFn = void(__fastcall*)(void*, bool);
+using FrameTickFn = void(__attribute__((fastcall))*)(void*, bool);
 
-static void __fastcall frame_tick_detour(void* engineCtx, bool isSuspended) {
-    // Snapshot raw_time before the original runs
+static void __attribute__((fastcall)) frame_tick_detour(void* engineCtx, bool isSuspended) {
     double raw_time_before = *s_offsets.frame_raw_time;
 
-    // Call original frame tick
     reinterpret_cast<FrameTickFn>(g_frame_tick_trampoline)(engineCtx, isSuspended);
 
-    // Compute delta from the engine's own raw time accumulation
     double raw_time_after = *s_offsets.frame_raw_time;
     double delta = raw_time_after - raw_time_before;
     if (delta < 0.0) delta = 0.0;
 
-    // Build event payload
     X4NativeFrameUpdate update{};
     update.delta            = delta;
     update.game_time        = *s_offsets.frame_game_time;
@@ -200,8 +168,6 @@ static void __fastcall frame_tick_detour(void* engineCtx, bool isSuspended) {
     auto* table = x4n::GameAPI::table();
     update.game_paused = (table && table->IsGamePaused) ? table->IsGamePaused() : false;
 
-    // Check for extension DLL changes and reload any that have autoreload enabled.
-    // Must happen before firing the event so no extension code is on the stack.
     x4n::ExtensionManager::tick();
     x4n::ExtensionManager::flush_pending_reloads();
 
@@ -211,14 +177,18 @@ static void __fastcall frame_tick_detour(void* engineCtx, bool isSuspended) {
 static bool install_frame_tick_hook() {
     void* target = x4n::GameAPI::get_internal("X4_FrameTick");
     if (!target) {
-        x4n::Logger::warn("Native frame hook: X4_FrameTick not resolved (missing RVA for this build?)");
+        x4n::Logger::warn("Native frame hook: X4_FrameTick not resolved");
         return false;
     }
 
-    g_x4_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    // Linux: get base address of main executable
+    Dl_info info;
+    if (dladdr((void*)&frame_tick_detour, &info)) {
+        g_x4_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+    }
     if (!g_x4_base) return false;
 
-    MH_STATUS status = MH_CreateHook(target, &frame_tick_detour, &g_frame_tick_trampoline);
+    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&frame_tick_detour), &g_frame_tick_trampoline);
     if (status != MH_OK) {
         x4n::Logger::error("Native frame hook: MH_CreateHook failed: {}", MH_StatusToString(status));
         return false;
@@ -245,26 +215,16 @@ static void remove_frame_tick_hook() {
 }
 
 // ---------------------------------------------------------------------------
-// [OBSOLETE] Radar visibility hook — fires on_radar_changed to extensions
-// Superseded by MD event hook: use x4n::md::on_radar_visibility_changed_before()
-// Kept for backward compatibility. Will be removed in a future version.
+// Radar visibility hook (OBSOLETE)
 // ---------------------------------------------------------------------------
-// Direct MinHook detour on the engine's RadarVisibilityChanged_BuildEvent.
-// Called from the sector update property change handler (case 378) when an
-// entity enters or leaves radar range. See docs/rev/VISIBILITY.md Section 3.
-// The original function creates a RadarVisibilityChangedEvent object; we
-// read entity_id and visible from it after it returns.
-
 static void* g_radar_event_trampoline = nullptr;
 
-using RadarEventBuildFn = void*(__fastcall*)(void*);
+using RadarEventBuildFn = void*(__attribute__((fastcall))*)(void*);
 
-static void* __fastcall radar_event_detour(void* property_data) {
-    // Call original — creates the event object
+static void* __attribute__((fastcall)) radar_event_detour(void* property_data) {
     void* event = reinterpret_cast<RadarEventBuildFn>(g_radar_event_trampoline)(property_data);
     if (!event) return event;
 
-    // Read event payload
     auto addr = reinterpret_cast<uintptr_t>(event);
     X4RadarChangedEvent payload{};
     payload.entity_id = *reinterpret_cast<uint64_t*>(addr + s_offsets.radar_event_entity_id);
@@ -277,11 +237,11 @@ static void* __fastcall radar_event_detour(void* property_data) {
 static bool install_radar_visibility_hook() {
     void* target = x4n::GameAPI::get_internal("RadarVisibilityChanged_BuildEvent");
     if (!target) {
-        x4n::Logger::warn("Radar visibility hook: RadarVisibilityChanged_BuildEvent not resolved (missing RVA for this build?)");
+        x4n::Logger::warn("Radar visibility hook: not resolved");
         return false;
     }
 
-    MH_STATUS status = MH_CreateHook(target, &radar_event_detour, &g_radar_event_trampoline);
+    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&radar_event_detour), &g_radar_event_trampoline);
     if (status != MH_OK) {
         x4n::Logger::error("Radar visibility hook: MH_CreateHook failed: {}", MH_StatusToString(status));
         return false;
@@ -308,32 +268,29 @@ static void remove_radar_visibility_hook() {
 }
 
 // ---------------------------------------------------------------------------
-// MD event dispatch hook — fires on_md_before / on_md_after per type_id
+// MD event dispatch hook
 // ---------------------------------------------------------------------------
-// MinHook detour on EventQueue_InsertOrDispatch. O(1) dispatch via flat
-// arrays indexed by type_id. Extensions subscribe via on_md_before/after().
-
 static void* g_md_event_trampoline = nullptr;
 
-static void __fastcall md_event_dispatch_detour(
+static void __attribute__((fastcall)) md_event_dispatch_detour(
     void* event_source, void* event_object, double timestamp, char immediate)
 {
     uint32_t type_id = UINT32_MAX;
 
     if (event_object) {
-        // Read type ID from vtable[1]: always `B8 imm32 C3` (mov eax, imm32; ret)
-        __try {
+        // Read type ID from vtable[1]
+        volatile uint32_t safe_type = UINT32_MAX;
+        __builtin_prefetch(event_object);
+        if (__builtin_expect(!__builtin_expect(0, 0), 1)) {
             auto vtable = *reinterpret_cast<void***>(event_object);
             auto fn_bytes = reinterpret_cast<uint8_t*>(vtable[1]);
             if (fn_bytes[0] == 0xB8 && fn_bytes[5] == 0xC3) {
-                type_id = *reinterpret_cast<uint32_t*>(fn_bytes + 1);
+                safe_type = *reinterpret_cast<uint32_t*>(fn_bytes + 1);
             }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            type_id = UINT32_MAX;
         }
+        type_id = safe_type;
     }
 
-    // Fire before-subscribers
     if (type_id < x4n::EventSystem::MAX_MD_TYPE) {
         uint64_t source_id = event_source ?
             *reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(event_source) + 8) : 0;
@@ -341,12 +298,10 @@ static void __fastcall md_event_dispatch_detour(
         x4n::EventSystem::md_fire_before(type_id, &payload);
     }
 
-    // Original dispatch — MD cue listeners fire here
-    using OrigFn = void(__fastcall*)(void*, void*, double, char);
+    using OrigFn = void(__attribute__((fastcall))*)(void*, void*, double, char);
     reinterpret_cast<OrigFn>(g_md_event_trampoline)(
         event_source, event_object, timestamp, immediate);
 
-    // Fire after-subscribers
     if (type_id < x4n::EventSystem::MAX_MD_TYPE) {
         uint64_t source_id = event_source ?
             *reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(event_source) + 8) : 0;
@@ -359,11 +314,11 @@ static bool install_md_event_hook() {
     auto* table = x4n::GameAPI::table();
     void* target = table ? reinterpret_cast<void*>(table->EventQueue_InsertOrDispatch) : nullptr;
     if (!target) {
-        x4n::Logger::warn("MD event hook: EventQueue_InsertOrDispatch not resolved (missing RVA for this build?)");
+        x4n::Logger::warn("MD event hook: EventQueue_InsertOrDispatch not resolved");
         return false;
     }
 
-    MH_STATUS status = MH_CreateHook(target, &md_event_dispatch_detour, &g_md_event_trampoline);
+    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&md_event_dispatch_detour), &g_md_event_trampoline);
     if (status != MH_OK) {
         x4n::Logger::error("MD event hook: MH_CreateHook failed: {}", MH_StatusToString(status));
         return false;
@@ -389,13 +344,11 @@ static void remove_md_event_hook() {
         MH_RemoveHook(target);
         g_md_event_trampoline = nullptr;
     }
-    // MD subscription cleanup handled by EventSystem::init() on next startup
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch implementations (called by proxy via function pointers)
+// Dispatch implementations
 // ---------------------------------------------------------------------------
-
 static void impl_discover_extensions() {
     x4n::ExtensionManager::discover();
     x4n::ExtensionManager::load_all();
@@ -414,9 +367,6 @@ static const char* impl_get_loaded_extensions() {
 }
 
 static void impl_set_lua_state(void* /*L*/) {
-    // Proxy owns the lua_State and the resolved Lua C-API table; core has
-    // no mirror to update. This dispatch slot remains so the proxy can
-    // notify subsystems if needed in the future.
     x4n::Logger::info("Lua state updated (UI reload)");
 }
 
@@ -460,80 +410,51 @@ static void impl_set_extension_setting(const char* ext_id, const char* key,
 }
 
 // ---------------------------------------------------------------------------
-// Exported functions (called by proxy DLL)
+// core_init implementation
 // ---------------------------------------------------------------------------
-
 static int core_init_impl(CoreInitContext* ctx) {
     g_ext_root             = ctx->ext_root;
     g_get_lua_property     = ctx->get_lua_property;
     g_get_lua_property_str = ctx->get_lua_property_str;
 
-    // 1. Logger — two-phase init. Start buffering in memory; the file is
-    //    opened in step 5 once we have GameAPI (needed to resolve the
-    //    user's X4 profile path). Early log lines are replayed on open.
     x4n::Logger::init(g_ext_root);
     x4n::Logger::info("X4Native core v" X4_GAME_VERSION_LABEL " initializing...");
     x4n::Logger::info("Extension root: {}", g_ext_root);
 
-    // 2. Event system
     x4n::EventSystem::init();
 
-    // 3. Game version
     g_game_version  = x4n::Version::detect();
     g_version_string = std::string(X4_GAME_VERSION_LABEL) +
                        " (game: " + g_game_version + ")";
 
-    // 3b. Build gate — version.dat only exposes the coarse version ("900"),
-    //     so this catches major game updates (9.00 → 9.10), not intra-version
-    //     builds (those are covered per-function by byte-signature checks in
-    //     load_internal_db). On mismatch, all RVA-derived features are
-    //     disabled: compiled offsets would read/patch wrong memory.
     const std::string& detected_build = x4n::Version::build();
     const std::string  expected_build = std::to_string(X4_GAME_TYPES_BUILD);
-    // Empty detected_build (version.dat unreadable; PE fallback doesn't set
-    // it) deliberately falls through to normal mode — the per-function
-    // byte-signature checks in load_internal_db remain the safety net there.
     const bool rva_safe_mode =
         !detected_build.empty() && detected_build != expected_build;
     if (rva_safe_mode) {
         x4n::Logger::error("GAME VERSION MISMATCH: running build {} but this "
                            "X4Native was compiled for build {} ({}). RVA-dependent "
-                           "features (frame tick, MD events, offsets, internal "
-                           "functions) are DISABLED. Exported game functions remain "
-                           "available. Update X4Native to a build matching your game.",
+                           "features disabled.",
                            detected_build, expected_build, X4_GAME_VERSION_LABEL);
     }
 
-    // 4. Game API — resolve X4.exe function pointers
     x4n::GameAPI::init();
     if (!rva_safe_mode)
         x4n::GameAPI::load_internal_db(g_ext_root, X4_GAME_VERSION_LABEL);
 
-    // 5. Logger — open file sink in <profile>\x4native\x4native.log and
-    //    flush the buffer produced by steps 1-4.
     x4n::Logger::open_files();
 
-    // 4b. Resolve pointer fields in game offsets (used by extensions and core
-    //     hooks). Skipped in safe mode — stale RVAs point at wrong memory;
-    //     null pointers make SDK helpers fail their existing guards instead.
     if (!rva_safe_mode)
         resolve_offset_pointers(x4n::GameAPI::exe_base());
 
-    // 5. Hook manager — MinHook initialization
     x4n::HookManager::init();
 
     if (!rva_safe_mode) {
-        // 5b. Native frame tick hook (core-owned, fires on_native_frame_update)
         install_frame_tick_hook();
-
-        // 5c. [OBSOLETE] Radar visibility hook — superseded by MD event hook (type_id 376)
         install_radar_visibility_hook();
-
-        // 5d. MD event dispatch hook (core-owned, fires on_md_before/on_md_after)
         install_md_event_hook();
     }
 
-    // 6. Extension manager
     g_raise_lua_event = ctx->raise_lua_event;
     g_register_lua_bridge = ctx->register_lua_bridge;
     g_stash_set    = ctx->stash_set;
@@ -545,7 +466,6 @@ static int core_init_impl(CoreInitContext* ctx) {
                                 g_stash_set, g_stash_get,
                                 g_stash_remove, g_stash_clear);
 
-    // 6. Fill the proxy's dispatch table
     ctx->dispatch->discover_extensions    = impl_discover_extensions;
     ctx->dispatch->raise_event            = impl_raise_event;
     ctx->dispatch->get_version            = impl_get_version;
@@ -562,21 +482,16 @@ static int core_init_impl(CoreInitContext* ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// Exported entry points — no C++ exception may cross the DLL/C boundary.
-// The proxy calls these raw; an escaping std::bad_alloc / format_error would
-// unwind through C frames into LuaJIT (undefined behavior).
+// Exported entry points
 // ---------------------------------------------------------------------------
-
-// Allocation-free — a handler that allocates could throw again and defeat
-// the guard (e.g. on bad_alloc).
 static void report_boundary_exception(const char* where, const char* what) {
     char buf[256];
     snprintf(buf, sizeof(buf), "X4Native core: exception in %s: %s\n",
              where, what ? what : "(unknown)");
-    OutputDebugStringA(buf);
+    fwrite(buf, 1, strlen(buf), stderr);
 }
 
-extern "C" __declspec(dllexport)
+extern "C" __attribute__((visibility("default")))
 int core_init(CoreInitContext* ctx) {
     try {
         return core_init_impl(ctx);
@@ -589,7 +504,7 @@ int core_init(CoreInitContext* ctx) {
     }
 }
 
-extern "C" __declspec(dllexport)
+extern "C" __attribute__((visibility("default")))
 void core_shutdown() {
     try {
         impl_shutdown();
@@ -601,8 +516,5 @@ void core_shutdown() {
 }
 
 // ---------------------------------------------------------------------------
-// DllMain — intentionally minimal
+// No DllMain on Linux
 // ---------------------------------------------------------------------------
-BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) {
-    return TRUE;
-}

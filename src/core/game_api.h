@@ -15,6 +15,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <cstdint>
 
 struct X4GameFunctions;
 

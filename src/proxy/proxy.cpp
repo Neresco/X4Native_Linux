@@ -1,24 +1,9 @@
 // ---------------------------------------------------------------------------
-// x4native_64.dll — Thin Proxy DLL
-//
-// This is the stable entry point loaded by Lua's package.loadlib().
-// It rarely changes, so the Windows file lock is irrelevant.
-//
-// Responsibilities:
-//   1. Resolve Lua API function pointers from host process
-//   2. Copy-on-load x4native_core.dll → x4native_core_live.dll
-//   3. LoadLibrary the copy, call core_init() to fill dispatch table
-//   4. Return a Lua table whose functions dispatch through the table
-//   5. On /reloadui: detect newer core on disk, hot-reload if needed
+// x4native_64.so — Thin Proxy Shared Library (Linux)
 // ---------------------------------------------------------------------------
 
 #include "lua_api.h"
 #include "x4native_defs.h"
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
 
 #include <cstdio>
 #include <cstring>
@@ -26,12 +11,25 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <linux/limits.h>
+#include <filesystem>
 
 // ---------------------------------------------------------------------------
-// State (persists across /reloadui because the proxy stays mapped)
+// State
 // ---------------------------------------------------------------------------
+// Serializes ALL core load/reload/dlopen/dlclose/dlsym operations. X4 can
+// re-enter luaopen_x4native() from worker threads (e.g. the "Movement worker"
+// spawned when NewMultiplayerGame starts a universe). Without this lock, two
+// threads can run load_core() concurrently: both copy_file() to the same
+// x4native_core_live.so and dlopen() it while the other is still reading it,
+// corrupting the module and causing a SIGSEGV inside dlsym()/ld-linux.
+// recursive so reload_core() may call load_core() without deadlocking.
+static std::recursive_mutex g_core_mutex;
+
 static lua_State*       g_lua            = nullptr;
-static HMODULE          g_core_module    = nullptr;
+static void*            g_core_module    = nullptr;
 static CoreDispatch     g_dispatch       = {};
 static core_init_fn     g_core_init      = nullptr;
 static core_shutdown_fn g_core_shutdown  = nullptr;
@@ -41,22 +39,16 @@ static std::string      g_core_live_path;
 static bool             g_initialized    = false;
 
 // ---------------------------------------------------------------------------
-// Core hot-reload state (compiled in when X4N_WITH_RELOAD=1)
+// Core hot-reload state
 // ---------------------------------------------------------------------------
-// Guarded on a dedicated feature flag rather than NDEBUG because the project's
-// actually-run build config is Release/RelWithDebInfo (std::string layout
-// must match the game's Release STL). Runtime behavior is separately gated
-// by the `autoreload` key in x4native_settings.json.
 #ifdef X4N_WITH_RELOAD
 #include <fstream>
 #include <nlohmann/json.hpp>
 
-static bool g_autoreload_enabled   = false;   // from x4native_settings.json
-static bool g_autoreload_checked   = false;   // settings file read?
-static FILETIME g_last_core_mtime  = {};       // last known timestamp
+static bool g_autoreload_enabled   = false;
+static bool g_autoreload_checked   = false;
+static std::filesystem::file_time_type g_last_core_mtime;
 
-/// Read x4native_settings.json to check "autoreload" flag.
-/// Called on each core load so the result is logged after hot-reloads too.
 static void read_autoreload_setting() {
     std::string path = g_ext_root + "x4native_settings.json";
     std::ifstream file(path);
@@ -64,37 +56,26 @@ static void read_autoreload_setting() {
         if (g_dispatch.log) g_dispatch.log(2, "Core autoreload: settings file not found");
         return;
     }
-
     try {
         auto cfg = nlohmann::json::parse(file);
         if (cfg.contains("autoreload") && cfg["autoreload"].is_boolean())
             g_autoreload_enabled = cfg["autoreload"].get<bool>();
     } catch (...) {}
-
     if (g_dispatch.log)
         g_dispatch.log(1, g_autoreload_enabled
             ? "Core autoreload: ENABLED"
             : "Core autoreload: disabled");
 }
 
-/// Check if core DLL on disk is newer than last known timestamp.
-/// Updates g_last_core_mtime on change.
 static bool core_modified_since_last_check() {
-    WIN32_FILE_ATTRIBUTE_DATA attr = {};
-    if (!GetFileAttributesExA(g_core_path.c_str(),
-                              GetFileExInfoStandard, &attr))
-        return false;
-
-    if (g_last_core_mtime.dwHighDateTime == 0 &&
-        g_last_core_mtime.dwLowDateTime == 0) {
-        // First call — seed with current timestamp
-        g_last_core_mtime = attr.ftLastWriteTime;
+    auto mtime = std::filesystem::last_write_time(g_core_path);
+    if (g_last_core_mtime.time_since_epoch().count() == 0) {
+        g_last_core_mtime = mtime;
         return false;
     }
-
-    if (CompareFileTime(&attr.ftLastWriteTime, &g_last_core_mtime) > 0) {
-        g_last_core_mtime = attr.ftLastWriteTime;
-        if (g_dispatch.log) g_dispatch.log(1, "Autoreload: core DLL modified on disk");
+    if (mtime > g_last_core_mtime) {
+        g_last_core_mtime = mtime;
+        if (g_dispatch.log) g_dispatch.log(1, "Autoreload: core .so modified on disk");
         return true;
     }
     return false;
@@ -102,8 +83,7 @@ static bool core_modified_since_last_check() {
 #endif // X4N_WITH_RELOAD
 
 // ---------------------------------------------------------------------------
-// Stash — in-memory key-value that survives /reloadui and core hot-reload
-// Keyed by namespace (typically extension name) + key.
+// Stash
 // ---------------------------------------------------------------------------
 static std::unordered_map<std::string,
            std::unordered_map<std::string, std::vector<uint8_t>>> g_stash;
@@ -145,7 +125,7 @@ static void proxy_stash_clear(const char* ns) {
     g_stash.erase(ns);
 }
 
-// Forward declarations (defined below with Lua-facing functions)
+// Forward declarations
 static int proxy_raise_lua_event(const char* name, const char* param);
 static int proxy_register_lua_bridge(const char* lua_event, const char* cpp_event);
 static bool proxy_get_lua_property(const char* getter_fn, X4nLuaKey key,
@@ -158,52 +138,47 @@ static bool proxy_get_lua_property_str(const char* getter_fn, X4nLuaKey key,
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
-
-/// Derive the extension root from the proxy DLL path.
-/// Proxy lives at <ext_root>/native/x4native_64.dll
 static std::string detect_ext_root() {
-    char buf[MAX_PATH];
-    HMODULE self = nullptr;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&detect_ext_root), &self);
-    GetModuleFileNameA(self, buf, MAX_PATH);
-
-    std::string p(buf);
-    auto pos = p.rfind("\\native\\");
-    if (pos != std::string::npos)
-        return p.substr(0, pos + 1);      // includes trailing backslash
-    // Fallback: parent of DLL
-    pos = p.rfind('\\');
-    return (pos != std::string::npos) ? p.substr(0, pos + 1) : p;
+    Dl_info info;
+    if (dladdr((void*)&detect_ext_root, &info)) {
+        std::string p(info.dli_fname);
+        p = std::filesystem::canonical(p).string();
+        auto pos = p.rfind("/native/");
+        if (pos != std::string::npos)
+            return p.substr(0, pos + 1);
+        pos = p.rfind('/');
+        return (pos != std::string::npos) ? p.substr(0, pos + 1) : p;
+    }
+    return ".";
 }
 
 // ---------------------------------------------------------------------------
-// Core DLL loading
+// Core .so loading
 // ---------------------------------------------------------------------------
-
 static bool load_core() {
-    // Copy-on-load: the original stays unlocked so builds can overwrite it
-    if (!CopyFileA(g_core_path.c_str(), g_core_live_path.c_str(), FALSE)) {
-        OutputDebugStringA("X4Native proxy: CopyFile failed for core DLL\n");
-        return false;
-    }
-
-    g_core_module = LoadLibraryA(g_core_live_path.c_str());
+    std::lock_guard<std::recursive_mutex> lock(g_core_mutex);
+    // Load the ORIGINAL core .so directly. We deliberately do NOT copy it to a
+    // shared "live" path first: multiple proxy instances (X4 can dlopen the
+    // proxy several times / re-enter it from worker threads) all used to
+    // copy_file() to the SAME x4native_core_live.so concurrently, corrupting
+    // the file while another thread was dlopen()ing it -> SIGSEGV inside
+    // dlsym()/ld-linux when NewMultiplayerGame spawns a "Movement worker" that
+    // re-enters luaopen_x4native(). dlopen() of the original path is safe
+    // (glibc refcounts the same inode; no file is rewritten).
+    g_core_module = dlopen(g_core_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!g_core_module) {
-        OutputDebugStringA("X4Native proxy: LoadLibrary failed for core DLL\n");
+        fprintf(stderr, "X4Native proxy: dlopen failed for core .so: %s\n", dlerror());
         return false;
     }
 
     g_core_init     = reinterpret_cast<core_init_fn>(
-                          GetProcAddress(g_core_module, "core_init"));
+                           dlsym(g_core_module, "core_init"));
     g_core_shutdown = reinterpret_cast<core_shutdown_fn>(
-                          GetProcAddress(g_core_module, "core_shutdown"));
+                           dlsym(g_core_module, "core_shutdown"));
 
     if (!g_core_init) {
-        OutputDebugStringA("X4Native proxy: core_init export not found\n");
-        FreeLibrary(g_core_module);
+        fprintf(stderr, "X4Native proxy: core_init export not found\n");
+        dlclose(g_core_module);
         g_core_module = nullptr;
         return false;
     }
@@ -222,8 +197,8 @@ static bool load_core() {
     ctx.get_lua_property_str = proxy_get_lua_property_str;
 
     if (g_core_init(&ctx) != 0) {
-        OutputDebugStringA("X4Native proxy: core_init returned error\n");
-        FreeLibrary(g_core_module);
+        fprintf(stderr, "X4Native proxy: core_init returned error\n");
+        dlclose(g_core_module);
         g_core_module = nullptr;
         return false;
     }
@@ -236,18 +211,17 @@ static bool load_core() {
 }
 
 static bool reload_core() {
-    // Tell current core to prepare (unhook, notify extensions)
+    std::lock_guard<std::recursive_mutex> lock(g_core_mutex);
     if (g_dispatch.prepare_reload)
         g_dispatch.prepare_reload();
 
     if (g_core_module) {
         if (g_core_shutdown)
             g_core_shutdown();
-        FreeLibrary(g_core_module);
+        dlclose(g_core_module);
         g_core_module = nullptr;
     }
 
-    // Reset dispatch table + function pointers
     g_dispatch      = {};
     g_core_init     = nullptr;
     g_core_shutdown = nullptr;
@@ -255,17 +229,14 @@ static bool reload_core() {
     return load_core();
 }
 
-// Exception guards for the load/reload paths. These run inside Lua C-function
-// frames — a C++ exception (e.g. bad_alloc from the std::string path work)
-// escaping into LuaJIT is undefined behavior, so contain it here.
 static bool first_load_guarded() noexcept {
     try {
         g_ext_root       = detect_ext_root();
-        g_core_path      = g_ext_root + "native\\x4native_core.dll";
-        g_core_live_path = g_ext_root + "native\\x4native_core_live.dll";
+        g_core_path      = g_ext_root + "native/x4native_core.so";
+        g_core_live_path = g_ext_root + "native/x4native_core_live.so";
         return load_core();
     } catch (...) {
-        OutputDebugStringA("X4Native proxy: exception during first core load\n");
+        fprintf(stderr, "X4Native proxy: exception during first core load\n");
         return false;
     }
 }
@@ -274,28 +245,23 @@ static bool reload_core_guarded() noexcept {
     try {
         return reload_core();
     } catch (...) {
-        OutputDebugStringA("X4Native proxy: exception during core reload\n");
+        fprintf(stderr, "X4Native proxy: exception during core reload\n");
         return false;
     }
 }
 
-/// Returns true if the on-disk core is newer than the live copy.
 static bool core_needs_reload() {
-    WIN32_FILE_ATTRIBUTE_DATA disk_attr = {}, live_attr = {};
-    if (!GetFileAttributesExA(g_core_path.c_str(),
-                              GetFileExInfoStandard, &disk_attr))
-        return false;
-    if (!GetFileAttributesExA(g_core_live_path.c_str(),
-                              GetFileExInfoStandard, &live_attr))
-        return true;   // live copy missing — need to load
-    return CompareFileTime(&disk_attr.ftLastWriteTime,
-                           &live_attr.ftLastWriteTime) > 0;
+    // With the proxy now dlopen()ing the original core path directly, there is
+    // no separate live copy to compare against. Auto-reload is off by default
+    // (x4native_settings.json autoreload=false); manual reload via the Lua
+    // reload() API still works. So never force a reload on re-entry.
+    (void)g_core_live_path;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
-// Lua-facing API functions  (thin forwarders into g_dispatch)
+// Lua-facing API functions
 // ---------------------------------------------------------------------------
-
 static int l_discover_extensions(lua_State* L) {
     if (g_dispatch.discover_extensions)
         g_dispatch.discover_extensions();
@@ -312,12 +278,6 @@ static int l_raise_event(lua_State* L) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Lua bridge: proxy_raise_lua_event
-//
-// Called by extensions (via core dispatch) to fire a Lua event.
-// Uses X4's global CallEventScripts() — same path as MD <raise_lua_event>.
-// ---------------------------------------------------------------------------
 static int proxy_raise_lua_event(const char* name, const char* param) {
     if (!g_lua) return -1;
     x4n::lua::getfield(g_lua, LUA_GLOBALSINDEX, "CallEventScripts");
@@ -327,38 +287,8 @@ static int proxy_raise_lua_event(const char* name, const char* param) {
     return x4n::lua::pcall(g_lua, 2, 0, 0);
 }
 
-// ---------------------------------------------------------------------------
-// Lua-property accessors: proxy_get_lua_property / _str
-//
-// Generic over Get*Data-style host C-funcs (GetWareData, GetComponentData,
-// future GetFactionData, …). SDK exposes typed inlines per domain
-// (x4n::ware::*, x4n::entity::*) — adding a new accessor never touches
-// proxy or core, only the SDK header. UI thread only.
-// ---------------------------------------------------------------------------
-// Resolve `getter_fn` and push (key, field). Returns false (and restores
-// stack) if any global is missing or pcall fails. On success leaves the
-// function and 2 args on the stack ready for pcall(2,1,0).
-//
-// UNIT64 keys go through ConvertStringToLuaID(tostring(uid)) — the engine's
-// Get*Data functions expect this opaque "Lua ID" form, NOT a bare
-// lua_Integer (verified empirically: lua_pushinteger produces a Lua number
-// that GetComponentData silently fails on, returning nil for every entity).
-// Vanilla pattern: menu_diplomacy.lua:1648, menu_interactmenu.lua:531/565/etc.
-// Resolve `getter_fn` and push (key, field). Returns false (and restores
-// stack) if any global is missing or pcall fails. On success leaves the
-// function and 2 args on the stack ready for pcall(2,1,0).
-//
-// UNIT64 keys go through ConvertStringToLuaID(tostring(uid)) — the engine's
-// Lua C-funcs expect this opaque "Lua ID" userdata form, NOT a bare
-// lua_Integer. Vanilla pattern: menu_diplomacy.lua:1648, menu_interactmenu.lua.
-//
-// CAVEAT: not every MD-script-accessible field is reachable through
-// GetComponentData. `buildresourcevalue` for example is exposed ONLY in MD
-// namespace (`component.{X}.buildresourcevalue`); GetComponentData returns
-// nil for it on valid live stations. Stick to fields that have at least one
-// vanilla Lua caller before adding an SDK domain helper for them.
 static bool prepare_call(int top, const char* getter_fn,
-                         const X4nLuaKey& key, const char* field) {
+                          const X4nLuaKey& key, const char* field) {
     if (key.type == X4N_KEY_UINT64) {
         x4n::lua::getfield(g_lua, LUA_GLOBALSINDEX, "ConvertStringToLuaID");
         if (x4n::lua::type(g_lua, -1) != LUA_TFUNCTION) {
@@ -373,7 +303,6 @@ static bool prepare_call(int top, const char* getter_fn,
             x4n::lua::settop(g_lua, top);
             return false;
         }
-        // Stack now has the converted Lua ID userdata on top.
     }
 
     x4n::lua::getfield(g_lua, LUA_GLOBALSINDEX, getter_fn);
@@ -383,8 +312,6 @@ static bool prepare_call(int top, const char* getter_fn,
     }
 
     if (key.type == X4N_KEY_UINT64) {
-        // Stack: [..., converted_id, getter_fn]. Insert getter_fn below
-        // converted_id so the call shape is getter_fn(converted_id, field).
         x4n::lua::insert(g_lua, -2);
     } else {
         x4n::lua::pushstring(g_lua, key.v.s ? key.v.s : "");
@@ -419,7 +346,6 @@ static bool proxy_get_lua_property(const char* getter_fn, X4nLuaKey key,
                 }
                 break;
             case X4N_VAL_BOOL:
-                // Strict: 1/0 numeric flags must be fetched as INT64.
                 if (t == LUA_TBOOLEAN) {
                     *static_cast<bool*>(out) =
                         x4n::lua::toboolean(g_lua, -1) != 0;
@@ -445,8 +371,6 @@ static bool proxy_get_lua_property_str(const char* getter_fn, X4nLuaKey key,
         if (x4n::lua::type(g_lua, -1) == LUA_TSTRING) {
             size_t len = 0;
             const char* s = x4n::lua::tolstring(g_lua, -1, &len);
-            // Truncation is failure — caller can't otherwise tell whether
-            // the returned value is the full string. Retry with larger buf.
             if (s && len + 1 <= buf_size) {
                 std::memcpy(out_buf, s, len);
                 out_buf[len] = '\0';
@@ -460,16 +384,9 @@ static bool proxy_get_lua_property_str(const char* getter_fn, X4nLuaKey key,
 
 // ---------------------------------------------------------------------------
 // Dynamic Lua→C++ event bridge
-//
-// Extensions call register_lua_bridge(lua_event, cpp_event) to wire a
-// Lua RegisterEvent handler that forwards into the C++ event bus.
-// A single C function (bridge_handler) is registered as an upvalue-based
-// Lua closure for each mapping.
 // ---------------------------------------------------------------------------
 static std::unordered_map<std::string, std::string> g_lua_bridges;
 
-// Lua closure: upvalue 1 = C++ event name string
-// Lua calls handler(eventName, argument1) — argument1 is at stack index 2
 static int bridge_handler(lua_State* L) {
     const char* cpp_event = x4n::lua::tostring(L, lua_upvalueindex(1));
     if (cpp_event && g_dispatch.raise_event) {
@@ -483,12 +400,8 @@ static int bridge_handler(lua_State* L) {
 
 static int proxy_register_lua_bridge(const char* lua_event, const char* cpp_event) {
     if (!g_lua || !lua_event || !cpp_event) return -1;
-
-    // Already registered?
     if (g_lua_bridges.count(lua_event)) return 0;
 
-    // Create a Lua closure with cpp_event as upvalue, then call RegisterEvent
-    // Stack: RegisterEvent, lua_event, closure
     x4n::lua::getfield(g_lua, LUA_GLOBALSINDEX, "RegisterEvent");
     x4n::lua::pushstring(g_lua, lua_event);
     x4n::lua::pushstring(g_lua, cpp_event);
@@ -551,12 +464,6 @@ static int l_prepare_reload(lua_State* L) {
 // ---------------------------------------------------------------------------
 // Per-extension settings — Lua marshalling
 // ---------------------------------------------------------------------------
-//
-// l_get_extension_settings(ext_id) returns an ordered array of row tables:
-//   { {id, name, type, current, default, options?, min?, max?, step?}, ... }
-// l_set_extension_setting(ext_id, key, value) writes the value (type inferred
-// from the Lua value).
-
 static void push_setting_row(lua_State* L, const SettingInfo& info) {
     x4n::lua::createtable(L, 0, 8);
 
@@ -578,7 +485,6 @@ static void push_setting_row(lua_State* L, const SettingInfo& info) {
             x4n::lua::pushboolean(L, info.default_bool);
             x4n::lua::setfield(L, -2, "default");
             break;
-
         case X4N_SETTING_SLIDER:
             x4n::lua::pushnumber(L, info.current_number);
             x4n::lua::setfield(L, -2, "current");
@@ -591,7 +497,6 @@ static void push_setting_row(lua_State* L, const SettingInfo& info) {
             x4n::lua::pushnumber(L, info.step);
             x4n::lua::setfield(L, -2, "step");
             break;
-
         case X4N_SETTING_DROPDOWN:
             x4n::lua::pushstring(L, info.current_string ? info.current_string : "");
             x4n::lua::setfield(L, -2, "current");
@@ -667,57 +572,41 @@ static int l_should_autoreload(lua_State* L) {
 
 // ---------------------------------------------------------------------------
 // Lua C-function exception guard
-//
-// Every l_* forwarder ends up in core code that allocates (Logger's
-// std::format, JSON serialization, settings marshalling). A C++ exception
-// escaping into LuaJIT's C frames is undefined behavior, so the whole API
-// table is registered through this shim. L_error's longjmp is unaffected:
-// with /EHsc, catch(...) sees only C++ exceptions, not SEH unwinds.
 // ---------------------------------------------------------------------------
 template <int (*Fn)(lua_State*)>
 static int lua_guarded(lua_State* L) {
     try {
         return Fn(L);
     } catch (...) {
-        OutputDebugStringA("X4Native proxy: exception in Lua API call\n");
+        fprintf(stderr, "X4Native proxy: exception in Lua API call\n");
         return 0;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Entry point — called by Lua: package.loadlib("...dll", "luaopen_x4native")
+// Entry point — called by Lua: package.loadlib("...so", "luaopen_x4native")
 // ---------------------------------------------------------------------------
-extern "C" __declspec(dllexport)
+extern "C" __attribute__((visibility("default")))
 int luaopen_x4native(lua_State* L) {
     g_lua = L;
 
-    // Resolve Lua C API function pointers (idempotent)
     if (!x4n::lua::resolve()) {
-        OutputDebugStringA("X4Native: FATAL — failed to resolve Lua API\n");
+        fprintf(stderr, "X4Native: FATAL — failed to resolve Lua API\n");
         return 0;
     }
 
     if (!g_initialized) {
-        // --- First load (game start) ---
         if (!first_load_guarded())
-            return x4n::lua::L_error(L, "X4Native: failed to load core DLL");
-
+            return x4n::lua::L_error(L, "X4Native: failed to load core .so");
         g_initialized = true;
     } else {
-        // --- /reloadui or save load: proxy already loaded, update lua_State ---
         if (g_dispatch.set_lua_state)
             g_dispatch.set_lua_state(L);
-
-        // Clear bridge cache — the old Lua state (and its RegisterEvent handlers)
-        // is gone; bridges must re-register on the new state.
         g_lua_bridges.clear();
-
-        // Hot-reload core if a newer build is on disk
         if (core_needs_reload())
             reload_core_guarded();
     }
 
-    // Build the Lua API table returned to x4native.lua
     x4n::lua::newtable(L);
 
     struct { const char* name; lua_CFunction fn; } funcs[] = {
@@ -741,42 +630,19 @@ int luaopen_x4native(lua_State* L) {
         x4n::lua::setfield(L, -2, f.name);
     }
 
-    return 1;  // one return value: the API table
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
-// DllMain
+// No DllMain needed on Linux — constructor/destructor attributes if needed
 // ---------------------------------------------------------------------------
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        // Pin this DLL so LuaJIT's FreeLibrary (on lua_close during save
-        // load) cannot unload us. This preserves all static state —
-        // g_initialized, g_core_module, g_dispatch — across Lua state
-        // destruction and recreation. Without this, save loads cause the
-        // proxy to unload while core_live.dll remains file-locked, making
-        // the next load_core() CopyFile fail.
-        HMODULE pinned = nullptr;
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_PIN,
-            reinterpret_cast<LPCSTR>(hModule),
-            &pinned);
-    } else if (reason == DLL_PROCESS_DETACH) {
-        if (reserved != nullptr) {
-            // Process is terminating. Other DLLs' statics may already be
-            // destroyed, all threads killed, heap potentially corrupted.
-            // The OS reclaims all memory, handles, pipes, and file locks.
-            // The connected peer detects the broken pipe and exits on its own.
-            return TRUE;
-        }
-        // Dynamic unload (FreeLibrary): safe to clean up.
-        // Unreachable while pinned, but correct if pinning is ever removed.
-        if (g_core_shutdown)
-            g_core_shutdown();
-        if (g_core_module) {
-            FreeLibrary(g_core_module);
-            g_core_module = nullptr;
-        }
+__attribute__((destructor))
+static void proxy_destructor() {
+    std::lock_guard<std::recursive_mutex> lock(g_core_mutex);
+    if (g_core_shutdown)
+        g_core_shutdown();
+    if (g_core_module) {
+        dlclose(g_core_module);
+        g_core_module = nullptr;
     }
-    return TRUE;
 }

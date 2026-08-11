@@ -1,30 +1,43 @@
+// ---------------------------------------------------------------------------
+// version.cpp — Game version detection (Linux port)
+//
+// On Windows this read the game's version.dat next to X4.exe, with a PE
+// version-info fallback. On Linux there is no PE image; the game directory
+// is provided via the X4_GAME_ROOT environment variable (set by the launcher
+// scripts) and defaults to the current working directory. Only version.dat is
+// used — the PE fallback is dropped.
+// ---------------------------------------------------------------------------
 #include "version.h"
 #include "logger.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "common/platform.h"
+
 #include <fstream>
 #include <sstream>
 #include <algorithm>
-#include <vector>
+#include <cctype>
+#include <cstdlib>
 
 namespace x4n {
+
+/// Resolve the game root directory (with trailing separator).
+static std::string game_root() {
+    const char* env = std::getenv("X4_GAME_ROOT");
+    if (env && env[0]) {
+        std::string dir(env);
+        if (!dir.empty() && dir.back() != '/' && dir.back() != '\\')
+            dir += '/';
+        return dir;
+    }
+    // Default: the current working directory (the launcher scripts run from
+    // the game directory).
+    return "./";
+}
 
 /// Primary: read <game_root>/version.dat — a plain-text file containing
 /// the build number as a single line (e.g. "900" for v9.00).
 static std::string read_version_dat() {
-    // Resolve game root from X4.exe's location
-    char exe_path[MAX_PATH];
-    if (!GetModuleFileNameA(nullptr, exe_path, MAX_PATH))
-        return {};
-
-    std::string dir(exe_path);
-    auto pos = dir.rfind('\\');
-    if (pos == std::string::npos) return {};
-    dir = dir.substr(0, pos + 1);  // includes trailing backslash
-
+    std::string dir = game_root();
     std::ifstream f(dir + "version.dat");
     if (!f.is_open()) return {};
 
@@ -60,7 +73,7 @@ static std::string format_version(const std::string& raw) {
 static std::string s_build_number;
 
 std::string Version::detect() {
-    // 1. Try version.dat (simple, reliable)
+    // Read version.dat from the game root (reliable on both platforms).
     std::string raw = read_version_dat();
     if (!raw.empty()) {
         s_build_number = raw;
@@ -69,34 +82,8 @@ std::string Version::detect() {
         return ver;
     }
 
-    // 2. Fallback: X4.exe PE file version
-    char exe_path[MAX_PATH];
-    if (!GetModuleFileNameA(nullptr, exe_path, MAX_PATH))
-        return "unknown";
-
-    DWORD dummy = 0;
-    DWORD size  = GetFileVersionInfoSizeA(exe_path, &dummy);
-    if (size == 0) {
-        Logger::warn("Version: no version info found");
-        return "unknown";
-    }
-
-    std::vector<BYTE> buf(size);
-    if (!GetFileVersionInfoA(exe_path, 0, size, buf.data()))
-        return "unknown";
-
-    VS_FIXEDFILEINFO* ffi = nullptr;
-    UINT ffi_len = 0;
-    if (!VerQueryValueA(buf.data(), "\\",
-                        reinterpret_cast<void**>(&ffi), &ffi_len) || !ffi)
-        return "unknown";
-
-    int major = HIWORD(ffi->dwFileVersionMS);
-    int minor = LOWORD(ffi->dwFileVersionMS);
-    char ver[32];
-    std::snprintf(ver, sizeof(ver), "%d.%02d", major, minor);
-    Logger::info("Detected game version (from PE): {}", ver);
-    return ver;
+    Logger::warn("Version: could not read version.dat from '{}'", game_root());
+    return "unknown";
 }
 
 const std::string& Version::build() {

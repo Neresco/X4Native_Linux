@@ -1,3 +1,7 @@
+Expect failure!
+I am at the moment just playing with it and using ai to as helper.
+No success at all is possible.
+
 # X4Native
 
 ![C++23](https://img.shields.io/badge/C%2B%2B-23-blue?style=flat-square&logo=cplusplus)

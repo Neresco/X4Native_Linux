@@ -22,6 +22,7 @@
 #include <mutex>
 #include <vector>
 #include <unordered_map>
+#include <string>
 #include <chrono>
 
 #include <sys/socket.h>
@@ -33,6 +34,13 @@
 static X4NativeAPI*    g_api  = nullptr;
 static X4GameFunctions* g_game = nullptr;
 
+// The game loads saves in TWO passes. on_game_loaded fires after the 1st pass
+// (entity IDs valid, but the universe is NOT fully built). Spawning/positioning
+// objects during the 2nd pass races the game's background "Movement worker"
+// thread and corrupts the object vectors -> SIGSEGV. So we only render once
+// on_universe_ready fires (after the 2nd pass / event_universe_generated).
+static volatile bool g_ready = false;   // set true on on_universe_ready
+
 // ---- Config (env overrides) ----------------------------------------------
 static int   g_stream_port   = 7778;   // X4MP_STREAM_PORT
 static int   g_render_interval = 3;    // frames between render passes (20Hz @60fps)
@@ -43,6 +51,7 @@ struct RemoteObj {
     unsigned long long host_id = 0;
     char macro[160] = {0};
     char faction[80] = {0};
+    char sector_macro[160] = {0}; // host sector macro name -> client sector
     // interpolation state
     float tx=0, ty=0, tz=0, tyaw=0, tpitch=0, troll=0; // latest target
     float px=0, py=0, pz=0;                            // previous position
@@ -54,6 +63,76 @@ struct RemoteObj {
 
 static std::unordered_map<unsigned long long, RemoteObj> g_objs;
 static std::mutex g_mutex;
+
+// Host sector MACRO name -> client sector UniverseID. Built once on
+// universe_ready (the client loads the same save, so sector macros match).
+static std::unordered_map<std::string, UniverseID> g_sector_map;
+
+// Resolve an object's MACRO name (for building the sector map).
+// GetComponentName returns the DISPLAY name ("Argon Prime"), which does NOT
+// match the host's streamed sector macro ("cluster_113_sector001_macro"). We
+// must query the "macro" property via the Lua API, exactly as the host does,
+// so the client's sector-map keys match the host's streamed macros.
+static void get_macro(UniverseID id, char* out, size_t outsize) {
+    out[0] = 0;
+    if (g_api && g_api->get_lua_property_str) {
+        X4nLuaKey k{};
+        k.type = X4N_KEY_UINT64;
+        k.v.u = id;
+        if (g_api->get_lua_property_str("GetComponentData", k, "macro", out, outsize))
+            return;
+    }
+    if (g_game && g_game->GetComponentName) {
+        const char* n = g_game->GetComponentName(id);
+        if (n) snprintf(out, outsize, "%s", n);
+    }
+}
+
+// Enumerate the client's own sectors (same save as host) and build a
+// macro-name -> sector-id map so host-streamed objects can be placed in the
+// correct client sector.
+//
+// GetSectorsByOwner is unreliable on a paused thin client (ownership data is
+// not computed). Instead we derive the sector set from the client's own loaded
+// objects (ships + stations) via GetContextByClass, which works regardless of
+// pause state. Called on universe_ready, before the ship cleanup runs.
+static void build_sector_map() {
+    g_sector_map.clear();
+    if (!g_game || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
+    const char* factions[64];
+    uint32_t nf = g_game->GetAllFactions(factions, 64, true);
+    auto add_sector = [&](UniverseID obj) {
+        if (!obj) return;
+        UniverseID sid = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "sector", false) : 0;
+        if (!sid) return;
+        char m[160]; get_macro(sid, m, sizeof(m));
+        if (m[0]) g_sector_map[m] = sid;
+    };
+    uint32_t iterated = 0, found = 0;
+    for (uint32_t f = 0; f < nf; f++) {
+        UniverseID ships[2048];
+        uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
+        for (uint32_t i = 0; i < ns; i++) { iterated++; add_sector(ships[i]); }
+        if (g_game->GetAllFactionStations) {
+            UniverseID stations[2048];
+            uint32_t nst = g_game->GetAllFactionStations(stations, 2048, factions[f]);
+            for (uint32_t i = 0; i < nst; i++) { iterated++; add_sector(stations[i]); }
+        }
+    }
+    if (g_api) {
+        char m[256];
+        snprintf(m, sizeof(m), "x4mp_stream: sector map built: %zu sectors (iterated %u objs)", g_sector_map.size(), iterated);
+        g_api->log(X4NATIVE_LOG_INFO, m);
+        // Sample a few mapped sectors to verify macro names match the host.
+        uint32_t shown = 0;
+        for (auto& kv : g_sector_map) {
+            if (shown++ >= 5) break;
+            char s[256];
+            snprintf(s, sizeof(s), "x4mp_stream: map sample: %s -> %llu", kv.first.c_str(), (unsigned long long)kv.second);
+            g_api->log(X4NATIVE_LOG_INFO, s);
+        }
+    }
+}
 
 // ---- Network --------------------------------------------------------------
 static int g_sock = -1;
@@ -67,34 +146,39 @@ static void net_log(const char* msg) {
 // ---- Receive thread: parse packets, store target positions ----------------
 static void parse_line(char* line) {
     if (strncmp(line, "OBJ", 3) == 0) {
-        unsigned long long id, zone, sector;
+        // OBJ <id> <sectormacro> <x> <y> <z> <yaw> <pitch> <roll> <faction> <macro>
+        unsigned long long id;
         float x, y, z, yaw, pitch, roll;
-        char faction[80], macro[160];
-        if (sscanf(line, "OBJ %llu %llu %llu %f %f %f %f %f %f %79s %159s",
-                   &id, &zone, &sector, &x, &y, &z, &yaw, &pitch, &roll, faction, macro) == 11) {
+        char sectormacro[160], faction[80], macro[160];
+        if (sscanf(line, "OBJ %llu %159s %f %f %f %f %f %f %79s %159s",
+                   &id, sectormacro, &x, &y, &z, &yaw, &pitch, &roll, faction, macro) == 10) {
             std::lock_guard<std::mutex> lk(g_mutex);
             RemoteObj& o = g_objs[id];
             if (o.has_target) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
             o.host_id = id;
             snprintf(o.macro, sizeof(o.macro), "%s", macro[0] ? macro : "?");
             snprintf(o.faction, sizeof(o.faction), "%s", faction[0] ? faction : "player");
+            snprintf(o.sector_macro, sizeof(o.sector_macro), "%s", sectormacro[0] ? sectormacro : "?");
             o.tx = x; o.ty = y; o.tz = z; o.tyaw = yaw; o.tpitch = pitch; o.troll = roll;
             o.last_update = std::chrono::steady_clock::now();
             o.has_target = true;
         }
     } else if (strncmp(line, "PLAYER", 6) == 0) {
-        // PLAYER <cid> <x> <y> <z> <yaw> <pitch> <roll> <macro>
+        // PLAYER <cid> <x> <y> <z> <yaw> <pitch> <roll> <macro> <faction>
+        // faction is the player's UNIQUE faction (x4mp_host / x4mp_client_N),
+        // so each player's ghost is owned by a distinct faction and can never
+        // be confused with another player.
         unsigned long long cid;
         float x, y, z, yaw, pitch, roll;
-        char macro[160];
-        if (sscanf(line, "PLAYER %llu %f %f %f %f %f %f %159s",
-                   &cid, &x, &y, &z, &yaw, &pitch, &roll, macro) == 8) {
+        char macro[160], faction[80];
+        if (sscanf(line, "PLAYER %llu %f %f %f %f %f %f %159s %79s",
+                   &cid, &x, &y, &z, &yaw, &pitch, &roll, macro, faction) == 9) {
             std::lock_guard<std::mutex> lk(g_mutex);
             RemoteObj& o = g_objs[cid];
             if (o.has_target) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
             o.host_id = cid;
             snprintf(o.macro, sizeof(o.macro), "%s", macro[0] ? macro : "?");
-            snprintf(o.faction, sizeof(o.faction), "player");
+            snprintf(o.faction, sizeof(o.faction), "%s", faction[0] ? faction : "player");
             o.tx = x; o.ty = y; o.tz = z; o.tyaw = yaw; o.tpitch = pitch; o.troll = roll;
             o.last_update = std::chrono::steady_clock::now();
             o.has_target = true;
@@ -121,6 +205,9 @@ static void recv_loop() {
 // game API from the main thread (called from on_frame_update).
 static void render_pass() {
     if (!g_game) return;
+    // Do NOT touch the object system until the universe is fully built (2nd
+    // load pass done). Spawning earlier races the Movement worker -> SIGSEGV.
+    if (!g_ready) return;
     if (!g_game->SpawnObjectAtPos2 || !g_game->SetObjectSectorPos) return;
     if (!g_game->GetPlayerZoneID || !g_game->GetContextByClass) return;
 
@@ -168,8 +255,17 @@ static void render_pass() {
         UIPosRot pos; pos.x = ix; pos.y = iy; pos.z = iz;
         pos.yaw = o.tyaw; pos.pitch = o.tpitch; pos.roll = o.troll;
 
+        // Place the object in the client sector matching the host's sector
+        // (same save => same sector macros). Fall back to the player sector if
+        // the macro is unknown.
+        UniverseID target_sector = client_sector;
+        if (o.sector_macro[0]) {
+            auto it = g_sector_map.find(o.sector_macro);
+            if (it != g_sector_map.end()) target_sector = it->second;
+        }
+
         if (!o.spawned) {
-            UniverseID newid = g_game->SpawnObjectAtPos2(o.macro, client_sector, pos,
+            UniverseID newid = g_game->SpawnObjectAtPos2(o.macro, target_sector, pos,
                                                          (o.faction[0]) ? o.faction : "player");
             if (newid != 0) {
                 o.client_id = newid;
@@ -177,8 +273,8 @@ static void render_pass() {
                 spawned_total++;
                 if (spawned_total < 60 || (spawned_total % 30) == 0) {
                     char dbg[192];
-                    snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] SPAWN id=%llu macro=%s at (%.0f,%.0f,%.0f) total=%u",
-                             (unsigned long long)kv.first, o.macro, ix, iy, iz, spawned_total);
+                    snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] SPAWN id=%llu macro=%s at (%.0f,%.0f,%.0f) sector=%s total=%u",
+                             (unsigned long long)kv.first, o.macro, ix, iy, iz, o.sector_macro, spawned_total);
                     net_log(dbg);
                 }
             }
@@ -193,7 +289,7 @@ static void render_pass() {
                 o.spawned = false; // ghost was destroyed; respawn next pass
                 continue;
             }
-            g_game->SetObjectSectorPos(o.client_id, client_sector, pos);
+            g_game->SetObjectSectorPos(o.client_id, target_sector, pos);
         }
     }
     for (auto id : dead) g_objs.erase(id);
@@ -206,8 +302,17 @@ static void on_frame_update(const char* /*name*/, void* /*data*/, void* /*ud*/) 
     render_pass();
 }
 
+// Universe fully built (2nd load pass complete). This is the definitive
+// "world ready" signal. Only now is it safe to start spawning host objects.
+static void on_universe_ready(const char* /*name*/, void* /*data*/, void* /*ud*/) {
+    g_ready = true;
+    build_sector_map();
+    if (g_api) g_api->log(X4NATIVE_LOG_INFO, "x4mp_stream: universe ready — rendering enabled");
+}
+
 // ---- Init / shutdown -------------------------------------------------------
 static int g_sub_tick = -1;
+static int g_sub_universe = -1;
 
 X4NATIVE_EXPORT int x4native_api_version(void) { return 1; }
 
@@ -244,6 +349,7 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     g_recv_thread = std::thread(recv_loop);
 
     g_sub_tick = api->subscribe("on_frame_update", on_frame_update, nullptr, api);
+    g_sub_universe = api->subscribe("on_universe_ready", on_universe_ready, nullptr, api);
 
     char m[128];
     snprintf(m, sizeof(m), "x4mp_stream: listening on UDP %d; render interval %d frames", g_stream_port, g_render_interval);
@@ -257,5 +363,6 @@ X4NATIVE_EXPORT void x4native_shutdown(void) {
     if (g_sock >= 0) close(g_sock);
     g_sock = -1;
     if (g_api && g_api->unsubscribe && g_sub_tick >= 0) g_api->unsubscribe(g_sub_tick);
+    if (g_api && g_api->unsubscribe && g_sub_universe >= 0) g_api->unsubscribe(g_sub_universe);
     net_log("x4mp_stream: shutting down");
 }

@@ -116,7 +116,13 @@ struct NetClient {
     std::chrono::steady_clock::time_point last_seen;
     bool loading = false; // client is loading its save (don't prune during load)
     uint16_t stream_port = 7778; // client's dedicated stream port (x4mp_stream)
+    char faction[80] = {0};      // unique player faction assigned by the host
 };
+
+// Unique faction id for a host-assigned client slot (1-based).
+static void client_faction_for(int id, char* out, size_t outsize) {
+    snprintf(out, outsize, "x4mp_client_%d", id);
+}
 static std::vector<NetClient> g_clients;
 
 // Host-side representation of each connected client's ship (so the host can
@@ -274,6 +280,7 @@ struct ZoneObj {
     unsigned long long id;
     char faction[80];
     char macro[160];
+    char sector_macro[160]; // sector MACRO name (client maps it to its own sector)
     // Delta-compression state: last position sent to clients. We only re-send
     // an object if it moved beyond g_delta_m (or a periodic full refresh).
     float last_x = 0, last_y = 0, last_z = 0;
@@ -321,8 +328,10 @@ static void net_send_snapshot_host() {
         if (pship) {
             UIPosRot ppos = g_game->GetObjectPositionInSector(pship);
             char pmacro[160]; get_macro(pship, pmacro, sizeof(pmacro));
-            char relay[256];
-            snprintf(relay, sizeof(relay), "PLAYER 0 %.3f %.3f %.3f %.3f %.3f %.3f %s\n",
+            char relay[320];
+            // The host's ghost is rendered on clients under the dedicated
+            // "x4mp_host" faction so it is never confused with a client ship.
+            snprintf(relay, sizeof(relay), "PLAYER 0 %.3f %.3f %.3f %.3f %.3f %.3f %s x4mp_host\n",
                      ppos.x, ppos.y, ppos.z, ppos.yaw, ppos.pitch, ppos.roll,
                      pmacro[0] ? pmacro : "?");
             net_send_stream(relay); // -> client's stream port (x4mp_stream)
@@ -491,15 +500,18 @@ static void client_receive_thread(int port) {
 // This mirrors how X4 single-player works: only what is near the player is
 // fully rendered/simulated; everything far away is reduced. We enumerate all
 // ships/stations at a low frequency and stream only those in the player's zone.
-// HOST: refresh the cached list of objects in the player's current zone.
-// Enumerating all ships/stations is expensive (~85k), so we only do this at a
-// low frequency; positions are then streamed every frame from the cache.
+// HOST: refresh the cached list of ALL ships in the universe (across every
+// sector), so clients receive the real, complete host state. Enumerating all
+// ships is expensive (~85k), so we only do this at a low frequency; positions
+// are then streamed every frame from the cache with delta compression.
+//
+// STATIONS are intentionally NOT streamed: the client loads the SAME (synced)
+// save, so it keeps its own stations which preserve sector ownership/claims.
+// Streaming stations too would duplicate them on the client.
 static void net_refresh_zone_objects() {
-    if (!g_game || !g_game->GetPlayerZoneID || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
-    UniverseID player_zone = g_game->GetPlayerZoneID();
-    if (player_zone == 0) return;
+    if (!g_game || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
     g_zone_objs.clear();
-    g_zone_objs_zone = player_zone;
+    g_zone_objs_zone = 0;
     // The host's own player ship is streamed separately via PLAYER cid=0, so
     // exclude it from the OBJ stream to avoid duplicate ghosts on the client.
     UniverseID host_player = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
@@ -512,34 +524,21 @@ static void net_refresh_zone_objects() {
             UniverseID obj = ships[i];
             if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
             if (host_player && obj == host_player) continue; // skip host player ship
-            UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
-            if (zone != player_zone) continue;
+            UniverseID sector = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "sector", false) : 0;
+            if (sector == 0) continue;
             ZoneObj zo; zo.id = obj;
             snprintf(zo.faction, sizeof(zo.faction), "%s", factions[f] ? factions[f] : "player");
             char macro[160]; get_macro(obj, macro, sizeof(macro));
             snprintf(zo.macro, sizeof(zo.macro), "%s", macro[0] ? macro : "?");
+            char sm[160]; get_macro(sector, sm, sizeof(sm));
+            snprintf(zo.sector_macro, sizeof(zo.sector_macro), "%s", sm[0] ? sm : "?");
             g_zone_objs.push_back(zo);
-        }
-        if (g_game->GetAllFactionStations) {
-            UniverseID stations[2048];
-            uint32_t nst = g_game->GetAllFactionStations(stations, 2048, factions[f]);
-            for (uint32_t i = 0; i < nst; i++) {
-                UniverseID obj = stations[i];
-                if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
-                UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
-                if (zone != player_zone) continue;
-                ZoneObj zo; zo.id = obj;
-                snprintf(zo.faction, sizeof(zo.faction), "%s", factions[f] ? factions[f] : "player");
-                char macro[160]; get_macro(obj, macro, sizeof(macro));
-                snprintf(zo.macro, sizeof(zo.macro), "%s", macro[0] ? macro : "?");
-                g_zone_objs.push_back(zo);
-            }
         }
     }
     if (g_debug) {
         char dbg[200];
-        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST refreshed zone=%llu objects: %zu",
-                 (unsigned long long)player_zone, g_zone_objs.size());
+        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST refreshed ALL ships: %zu (stations kept client-side)",
+                 g_zone_objs.size());
         net_debug(dbg);
     }
 }
@@ -547,6 +546,16 @@ static void net_refresh_zone_objects() {
 // HOST: stream the current positions of the cached zone objects to clients.
 // Called every frame (fast — no enumeration). All OBJ lines are batched into a
 // single UDP packet to avoid flooding the network with 200 packets/frame.
+// Send a filled OBJ batch (one UDP packet) to every client's stream port.
+static void net_send_obj_batch(const char* batch, size_t len) {
+    if (len == 0) return;
+    char tmp[60000];
+    size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+    memcpy(tmp, batch, n);
+    tmp[n] = 0;
+    net_send_stream(tmp);
+}
+
 static void net_send_objects_host() {
     if (!g_game || g_clients.empty() || g_zone_objs.empty()) return;
     char batch[60000];
@@ -560,13 +569,12 @@ static void net_send_objects_host() {
     // Delta compression: only re-send an object if it moved beyond g_delta_m
     // (or on a periodic full refresh). This drastically cuts bandwidth/CPU.
     bool force_full = (g_net_tick % g_full_refresh_interval) == 0;
+    size_t streamed = 0;
     for (auto& zo : g_zone_objs) {
         UniverseID obj = (UniverseID)zo.id;
         // Skip objects that no longer exist (destroyed). IsValidComponent avoids
         // the engine's "Failed to retrieve" warnings for dead IDs.
         if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
-        UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
-        if (zone == 0) continue; // no zone context -> not a live world object
         UIPosRot pos = g_game->GetObjectPositionInSector(obj);
         // Delta check: skip if not moved enough and not a forced full refresh.
         if (!force_full && zo.sent) {
@@ -574,30 +582,30 @@ static void net_send_objects_host() {
             if ((dx*dx + dy*dy + dz*dz) < g_delta_m * g_delta_m) continue;
         }
         zo.last_x = pos.x; zo.last_y = pos.y; zo.last_z = pos.z; zo.sent = true;
-        UniverseID sector = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "sector", false) : 0;
-        char buf[600];
-        int n = snprintf(buf, sizeof(buf), "OBJ %llu %llu %llu %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
-                         (unsigned long long)obj, (unsigned long long)zone, (unsigned long long)sector,
+        char buf[700];
+        int n = snprintf(buf, sizeof(buf),
+                         "OBJ %llu %s %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
+                         (unsigned long long)obj, zo.sector_macro,
                          pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.roll,
                          zo.faction, zo.macro);
-        if (used + (size_t)n < sizeof(batch)) {
-            memcpy(batch + used, buf, (size_t)n);
-            used += (size_t)n;
+        // Multi-packet batching: flush when the packet is nearly full so a full
+        // universe (~85k ships) is streamed in many packets, not one overflow.
+        if (used + (size_t)n >= sizeof(batch)) {
+            net_send_obj_batch(batch, used);
+            used = 0;
         }
+        memcpy(batch + used, buf, (size_t)n);
+        used += (size_t)n;
+        streamed++;
         live.push_back(zo);
     }
     // Update the cache with only live objects so dead IDs are not re-streamed.
     if (live.size() != g_zone_objs.size()) g_zone_objs = std::move(live);
-    if (used > 0) {
-        batch[used] = 0;
-        net_send_stream(batch); // -> client's dedicated stream port (x4mp_stream)
-        if (g_debug && (g_net_tick % 300) == 0) {
-            char dbg[160];
-            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST OBJ batch: %zu bytes, %zu objs%s", used, live.size(), force_full ? " (FULL)" : "");
-            net_debug(dbg);
-        }
-    } else if (g_debug && (g_net_tick % 300) == 0) {
-        net_debug("x4mp: [DBG] HOST OBJ batch EMPTY (all filtered/stationary)");
+    if (used > 0) net_send_obj_batch(batch, used);
+    if (g_debug && (g_net_tick % 300) == 0) {
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST OBJ streamed %zu ships%s (cache %zu)", streamed, force_full ? " (FULL)" : "", g_zone_objs.size());
+        net_debug(dbg);
     }
 }
 
@@ -742,16 +750,21 @@ static void thin_client_render_objects() {
     }
 }
 
-// OPTION 2: remove the client's own save objects (except the player's ship) so
-// the client renders ONLY host-streamed objects. Called once after the save has
-// fully loaded, so the client no longer renders the full universe (lower CPU).
+// OPTION 2: remove the client's own SAVE SHIPS (except the player's ship) so
+// the client does not double-render the host's ships (x4mp_stream already
+// spawns the authoritative host ships).
+//
+// STATIONS ARE KEPT: they are static and define sector ownership/claims. The
+// client loads the SAME (synced) save as the host, so its own stations match
+// the host's. Removing them would wipe every station + sector claim on the
+// client, making the universe inaccurate. So we only remove duplicate ships.
 static void thin_client_cleanup_own_objects() {
     if (!g_game || g_cleanup_done) return;
     if (!g_game->RemoveComponent || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
     UniverseID player_ship = g_game->GetPlayerControlledShipID ? g_game->GetPlayerControlledShipID() : 0;
     const char* factions[64];
     uint32_t nf = g_game->GetAllFactions(factions, 64, true);
-    uint32_t removed = 0, total_ships = 0, total_stations = 0;
+    uint32_t removed = 0, total_ships = 0;
     for (uint32_t f = 0; f < nf; f++) {
         UniverseID ships[2048];
         uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
@@ -761,22 +774,14 @@ static void thin_client_cleanup_own_objects() {
             g_game->RemoveComponent(ships[i]);
             removed++;
         }
-        if (g_game->GetAllFactionStations) {
-            UniverseID stations[2048];
-            uint32_t nst = g_game->GetAllFactionStations(stations, 2048, factions[f]);
-            total_stations += nst;
-            for (uint32_t i = 0; i < nst; i++) {
-                g_game->RemoveComponent(stations[i]);
-                removed++;
-            }
-        }
+        // Stations intentionally NOT removed (sector claims must survive).
     }
     g_cleanup_done = true;
     if (g_debug) {
         char dbg[200];
         snprintf(dbg, sizeof(dbg),
-                 "x4mp: [DBG] CLIENT cleanup: %u factions, %u ships, %u stations, removed %u (kept player ship %llu)",
-                 nf, total_ships, total_stations, removed, (unsigned long long)player_ship);
+                 "x4mp: [DBG] CLIENT cleanup: %u factions, %u ships, removed %u ships (kept player ship %llu; stations kept)",
+                 nf, total_ships, removed, (unsigned long long)player_ship);
         net_debug(dbg);
     }
 }
@@ -802,16 +807,20 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 nc.addr = from;
                 nc.last_seen = std::chrono::steady_clock::now();
                 g_clients.push_back(nc);
+                // Assign this client a UNIQUE player faction so it is
+                // distinguishable from the host and from every other client.
+                int id = (int)g_clients.size();
+                client_faction_for(id, g_clients.back().faction, sizeof(g_clients.back().faction));
                 // A brand-new client has no objects yet, so force a full object
                 // stream (clear delta state) so it gets the complete zone.
                 for (auto& zo : g_zone_objs) zo.sent = false;
                 char resp[64];
-                int id = (int)g_clients.size();
                 snprintf(resp, sizeof(resp), "WELCOME %d\n", id);
                 net_send(&from, resp);
-                char lbuf[128];
-                snprintf(lbuf, sizeof(lbuf), "x4mp: net: client joined (id=%d, %s:%u)", id,
-                         inet_ntoa(from.sin_addr), (unsigned)ntohs(from.sin_port));
+                char lbuf[192];
+                snprintf(lbuf, sizeof(lbuf), "x4mp: net: client joined (id=%d, %s:%u) faction=%s", id,
+                         inet_ntoa(from.sin_addr), (unsigned)ntohs(from.sin_port),
+                         g_clients.back().faction);
                 net_log(lbuf);
             } else {
                 // Re-join from an existing client (e.g. after a link drop):
@@ -864,6 +873,11 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 ClientShipState& st = g_client_ship_state[key];
                 st.x = x; st.y = y; st.z = z; st.yaw = yaw; st.pitch = pitch; st.roll = roll;
                 snprintf(st.macro, sizeof(st.macro), "%s", macro[0] ? macro : "?");
+                // This client's UNIQUE faction (assigned at JOIN). The host's own
+                // ship keeps the vanilla "player" faction, so every client ghost
+                // is distinguishable from the host and from every other client.
+                NetClient* sender = find_client(from);
+                const char* cfaction = (sender && sender->faction[0]) ? sender->faction : "player";
                 // Spawn/update the ghost on the host (host's player sector).
                 UniverseID sector = (g_game && g_game->GetPlayerZoneID && g_game->GetContextByClass)
                     ? g_game->GetContextByClass(g_game->GetPlayerZoneID(), "sector", false) : 0;
@@ -872,19 +886,21 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 auto it = g_client_ships.find(key);
                 if (it == g_client_ships.end()) {
                     if (g_game && g_game->SpawnObjectAtPos2 && sector) {
-                        UniverseID ship = g_game->SpawnObjectAtPos2(st.macro, sector, pos, "player");
+                        UniverseID ship = g_game->SpawnObjectAtPos2(st.macro, sector, pos, cfaction);
                         if (ship) g_client_ships[key] = ship;
-                        if (g_debug) { char dbg[200]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client ghost id=%llu macro=%s", (unsigned long long)ship, st.macro); net_debug(dbg); }
+                        if (g_debug) { char dbg[240]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client ghost id=%llu macro=%s faction=%s", (unsigned long long)ship, st.macro, cfaction); net_debug(dbg); }
                     }
                 } else {
                     if (g_game && g_game->SetObjectSectorPos && sector)
                         g_game->SetObjectSectorPos(it->second, sector, pos);
                 }
-                // Relay to all OTHER clients (via their stream port).
-                char relay[256];
+                // Relay to all OTHER clients (via their stream port), including
+                // this client's unique faction so they can render it correctly.
+                char relay[320];
                 int rn = snprintf(relay, sizeof(relay),
-                                  "PLAYER %llu %.3f %.3f %.3f %.3f %.3f %.3f %s\n",
-                                  (unsigned long long)key, x, y, z, yaw, pitch, roll, st.macro);
+                                  "PLAYER %llu %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
+                                  (unsigned long long)key, x, y, z, yaw, pitch, roll, st.macro, cfaction);
+                (void)rn;
                 for (auto& c : g_clients) {
                     if (c.addr.sin_port == from.sin_port && c.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
                     struct sockaddr_in sa = c.addr;
@@ -906,9 +922,9 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
             // Host relayed another client's ship: PLAYER <cid> <x> <y> <z> <yaw> <pitch> <roll> <macro>
             // Spawn/update a ghost of that remote client in OUR player sector so
             // we can see them. (We never receive our own relay, so no self-ghost.)
-            unsigned long long cid; float x, y, z, yaw, pitch, roll; char macro[160];
-            if (sscanf(msg, "PLAYER %llu %f %f %f %f %f %f %159s",
-                       &cid, &x, &y, &z, &yaw, &pitch, &roll, macro) == 8) {
+            unsigned long long cid; float x, y, z, yaw, pitch, roll; char macro[160], faction[80];
+            if (sscanf(msg, "PLAYER %llu %f %f %f %f %f %f %159s %79s",
+                       &cid, &x, &y, &z, &yaw, &pitch, &roll, macro, faction) == 9) {
                 UniverseID player_zone = (g_game && g_game->GetPlayerZoneID) ? g_game->GetPlayerZoneID() : 0;
                 UniverseID sector = (g_game && g_game->GetContextByClass && player_zone)
                     ? g_game->GetContextByClass(player_zone, "sector", false) : 0;
@@ -917,7 +933,8 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 auto it = g_remote_ships.find(cid);
                 if (it == g_remote_ships.end()) {
                     if (g_game && g_game->SpawnObjectAtPos2 && sector) {
-                        UniverseID ship = g_game->SpawnObjectAtPos2(macro[0] ? macro : "?", sector, pos, "player");
+                        UniverseID ship = g_game->SpawnObjectAtPos2(macro[0] ? macro : "?", sector, pos,
+                                                                   faction[0] ? faction : "player");
                         if (ship) g_remote_ships[cid] = ship;
                     }
                 } else {
@@ -1296,14 +1313,23 @@ static void on_frame_update(const char* /*event_name*/, void* data, void* /*user
             }
         }
         if (g_pause_enabled) thin_client_render();
-        thin_client_render_objects();
+        // Object rendering is handled by the dedicated x4mp_stream extension
+        // (smoothing + dead-object pruning). x4mp.so intentionally does NOT call
+        // thin_client_render_objects() here — doing so would spawn a SECOND copy
+        // of every host object (double-render / duplicate ships under the real
+        // ones). x4mp.so keeps only the control channel (SNAP camera, PLAYER
+        // relay, INPUT) and the own-object cleanup below.
+        //
         // OPTION 2: remove the client's own save objects shortly after the save
-        // has loaded, so the client renders only host-streamed objects.
+        // has loaded, so the client renders ONLY host-streamed objects. Enabled
+        // by default for the thin client (no more duplicates under player/NPC
+        // ships). Disable with X4MP_CLEANUP=0 if you want to keep the client's
+        // own universe visible.
         if (g_cleanup_pending && !g_cleanup_done && g_cleanup_enabled) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - g_ready_time)
                                .count();
-            if (elapsed >= 30000) {
+            if (elapsed >= 5000) {
                 g_cleanup_pending = false;
                 thin_client_cleanup_own_objects();
             }

@@ -35,6 +35,28 @@
 //   X4MP_MODULE     default gamestart id for host() (default
 //                    "x4ep1_gamestart_boron1")
 //   X4MP_DIFFICULTY default difficulty for host() (default "easy")
+//
+// Simulation model ("high simulation" per rendering zone + reconciliation):
+//   Every participant's rendering zone is fully simulated AND synced:
+//     * HOST  : the server player's sector is fully simulated (X4 default),
+//               plus every connected client's current sector (ships there are
+//               ActivateObject()'d, same treatment as the server player's
+//               zone). The host streams each client the ships in THAT client's
+//               current sector only (full snapshot on join/sector change, then
+//               deltas) — the reconciliation feed.
+//     * CLIENT: the client loads the SAME (synced) save and its own game
+//               fully simulates the client's current sector natively (ships
+//               behave normally). x4mp_stream binds each host-streamed ship to
+//               the matching local ship (same macro, nearest) and corrects the
+//               local ship to the host position when drift exceeds X4MP_SYNC_M;
+//               local ships the host no longer reports are removed. Result: all
+//               clients + host show the same ship positions.
+//   Opt-ins (testing / legacy):
+//     * X4MP_STREAMSHIPS=1  legacy full-universe OBJ broadcast to all clients
+//     * X4MP_FULLSIM=1      host ActivateObject()s ALL ships (CPU-heavy)
+//     * X4MP_TELEPORT=1     host teleports the server player into a client sector
+//     * X4MP_CLEANUP=1      client removes its own save ships (thin client)
+//     * X4MP_PAUSE=1        client pauses its local simulation (thin client)
 // ---------------------------------------------------------------------------
 #include <cstdlib>
 #include <cstring>
@@ -44,10 +66,13 @@
 #include <vector>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <cerrno>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -80,6 +105,9 @@ static int             g_join_wait_frames = 0;  // client: frames waited for men
 static int             g_join_retry_frames = 0; // client: frames since last retry
 static int             g_join_attempts = 0;     // client: total join attempts
 static bool            g_client_ready = false;  // thin client: in universe, ready to render host state
+// Follow-up (player-action replication): X4MP_TEST_ACTION=1 makes the client
+// send a periodic ACT message to the host to validate the action transport.
+static bool            g_test_action = false;
 static bool            g_universe_ready = false; // universe fully built (2nd load pass done)
 static bool            g_game_loaded_fired = false; // client: on_game_loaded has fired (1st pass done)
 static std::chrono::steady_clock::time_point g_game_loaded_time; // when client's 1st pass completed
@@ -111,12 +139,26 @@ static std::string     g_net_host_ip = "192.168.1.16";
 static struct sockaddr_in g_host_sa;
 
 // Host-side client tracking with liveness (for dead-client pruning).
+// Last position sent to one client (per-client delta compression).
+struct Float3 { float x = 0, y = 0, z = 0; };
+
 struct NetClient {
     struct sockaddr_in addr;
+    int id = 0;                 // unique, monotonic client id (never reused)
     std::chrono::steady_clock::time_point last_seen;
     bool loading = false; // client is loading its save (don't prune during load)
     uint16_t stream_port = 7778; // client's dedicated stream port (x4mp_stream)
     char faction[80] = {0};      // unique player faction assigned by the host
+    // Per-client sync-stream state (zone-limited OBJ stream):
+    UniverseID cur_sector = 0;  // this client's current sector (host ids)
+    bool needs_full = true;     // send a full sector snapshot on the next stream
+    std::chrono::steady_clock::time_point cur_sector_set_time{}; // when cur_sector last changed
+    std::unordered_map<unsigned long long, Float3> last_sent; // per-client deltas
+    // TCP stream connection to the client's x4mp_stream (port stream_port):
+    int  tcp_fd = -1;           // connected TCP fd (-1 = not connected)
+    int  tcp_backoff = 0;       // ticks to wait before retrying the connect
+    bool tcp_connecting = false;// non-blocking connect in progress
+    ~NetClient() { if (tcp_fd >= 0) close(tcp_fd); }
 };
 
 // Unique faction id for a host-assigned client slot (1-based).
@@ -124,6 +166,9 @@ static void client_faction_for(int id, char* out, size_t outsize) {
     snprintf(out, outsize, "x4mp_client_%d", id);
 }
 static std::vector<NetClient> g_clients;
+// Monotonic client-id counter: ids are never reused, so a client that joins
+// after another is pruned cannot collide with the old client's faction/ghost.
+static int g_next_client_id = 1;
 
 // Host-side representation of each connected client's ship (so the host can
 // SEE the client's ship). Key = hash of client sockaddr; value = spawned ship id.
@@ -134,6 +179,8 @@ static std::unordered_map<uint64_t, UniverseID> g_client_ships;
 struct ClientShipState {
     float x=0, y=0, z=0, yaw=0, pitch=0, roll=0;
     char macro[160] = {0};
+    char sector_macro[160] = {0}; // client's sector macro (to place ghost + move host player)
+    UniverseID host_sector = 0;   // host's version of the client's sector (0 = unknown)
 };
 static std::unordered_map<uint64_t, ClientShipState> g_client_ship_state;
 
@@ -151,8 +198,43 @@ static long long       g_client_link_timeout_ms = 15000; // X4MP_CLIENT_TIMEOUT
 static std::chrono::steady_clock::time_point g_client_last_recv; // client: last host data
 static bool            g_debug = false;   // X4MP_DEBUG=1 -> continuous streamed-data display
 static std::string     g_objmode = "cache"; // X4MP_OBJMODE=cache|full (object streaming)
-static bool            g_cleanup_enabled = true; // X4MP_CLEANUP=0 disables client own-object removal
+static bool            g_cleanup_enabled = false; // X4MP_CLEANUP=1 enables client own-object removal (thin client)
 static bool            g_pause_enabled = false;  // X4MP_PAUSE=1 pauses client (thin-client offload)
+// X4MP_FULLSIM=1 forces the host to fully simulate EVERY ship in the universe
+// (ActivateObject on all ~85k). CPU-heavy; testing only. Default 0: the host
+// fully simulates just the high-simulation set — the server player's sector
+// plus every connected client's current sector — so each participant has a
+// fully simulated rendering zone without simulating the whole universe.
+static bool            g_fullsim = false;         // X4MP_FULLSIM=1 enables full-universe simulation
+// X4MP_TELEPORT=1: legacy behaviour — teleport the host (server) player ship
+// into a client's sector to force simulation of that sector. Off by default:
+// the per-sector ActivateObject() (high-simulation set) achieves the same
+// without moving the server player around.
+static bool            g_teleport_enabled = false;
+// Rate-limit for moving the host player into a client's sector (only used when
+// X4MP_TELEPORT=1). Moving the host player is a teleport that stresses the
+// engine; if the client flies fast through many sectors, teleporting every
+// update can crash the game. Only move at most once per this interval (ms).
+static std::chrono::steady_clock::time_point g_last_player_move;
+static int             g_player_move_interval_ms = 2000; // X4MP_PLAYER_MOVE_INTERVAL
+// X4MP_STREAMSHIPS=1: host streams the full ship universe (OBJ messages) to
+// clients (thin-client / testing mode). Default 0: clients keep their own
+// locally simulated universe (the synced save) and only receive human PLAYER
+// ghosts — each client's rendering zone is fully simulated by its own game.
+static bool            g_stream_ships = false;
+// Sectors that already have a player-owned simulation satellite. X4 keeps
+// sectors where the player has assets active. We place one in every
+// high-simulation sector (server player + connected clients).
+static std::unordered_set<UniverseID> g_sat_sectors;
+// Host: map from sector macro name -> host sector UniverseID. Built during the
+// simulation maintenance pass. Used to place client ghosts in the correct
+// sector and to compute the high-simulation sector set.
+static std::unordered_map<std::string, UniverseID> g_host_sector_by_macro;
+// High-simulation sector set: the server player's sector plus every connected
+// client's current sector. Ships in these sectors are ActivateObject()'d so
+// they are fully simulated (high attention) even though the local player is
+// not there. Rebuilt on every maintenance pass.
+static std::unordered_set<UniverseID> g_highsim_sectors;
 
 static void net_log(const char* msg) {
     if (g_api) g_api->log(X4NATIVE_LOG_INFO, msg);
@@ -226,17 +308,85 @@ static void net_send_host(const char* msg) {
     for (auto& c : g_clients) net_send(&c.addr, msg);
 }
 
-// Send object/player RENDERING data to each client's dedicated stream port
+// HOST: send a batch over ONE client's TCP stream. Returns false on failure.
+// A real error (EPIPE/ECONNRESET) drops the connection so net_client_tcp()
+// reconnects next tick; a send-timeout just returns false (retry next tick).
+static bool net_send_tcp(NetClient& c, const char* msg, size_t len) {
+    if (c.tcp_fd < 0) return false;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(c.tcp_fd, msg + off, len - off, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return false; // send timeout
+            close(c.tcp_fd); c.tcp_fd = -1; // real error (EPIPE/ECONNRESET)
+            return false;
+        }
+        off += (size_t)w;
+    }
+    return true;
+}
+
+// HOST: maintain the per-client TCP stream connection. The client's x4mp_stream
+// listens on its stream port; we connect (non-blocking, short backoff) so a
+// not-yet-ready client never stalls the game thread. On a trusted LAN the
+// connect succeeds or is refused immediately.
+static void net_client_tcp(NetClient& c) {
+    if (c.tcp_connecting) {
+        int err = 0; socklen_t el = sizeof(err);
+        if (getsockopt(c.tcp_fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) {
+            c.tcp_connecting = false;
+            int fl = fcntl(c.tcp_fd, F_GETFL, 0);
+            fcntl(c.tcp_fd, F_SETFL, fl & ~O_NONBLOCK); // -> blocking
+            struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 250000; // send timeout
+            setsockopt(c.tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            int one = 1; setsockopt(c.tcp_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            char m[128];
+            snprintf(m, sizeof(m), "x4mp: net: TCP stream connected to %s:%u",
+                     inet_ntoa(c.addr.sin_addr), (unsigned)c.stream_port);
+            net_log(m);
+        } else {
+            close(c.tcp_fd); c.tcp_fd = -1; c.tcp_connecting = false;
+            c.tcp_backoff = 15;
+        }
+        return;
+    }
+    if (c.tcp_fd >= 0) return; // already connected
+    if (c.tcp_backoff > 0) { c.tcp_backoff--; return; }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { c.tcp_backoff = 15; return; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    struct sockaddr_in sa = c.addr;
+    sa.sin_port = htons(c.stream_port);
+    int r = connect(fd, (struct sockaddr*)&sa, sizeof(sa));
+    if (r == 0) {
+        fcntl(fd, F_SETFL, fl & ~O_NONBLOCK); // -> blocking
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 250000; // send timeout
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        c.tcp_fd = fd;
+        char m[128];
+        snprintf(m, sizeof(m), "x4mp: net: TCP stream connected to %s:%u",
+                 inet_ntoa(c.addr.sin_addr), (unsigned)c.stream_port);
+        net_log(m);
+    } else if (errno == EINPROGRESS) {
+        c.tcp_fd = fd; c.tcp_connecting = true; // verify next tick
+    } else {
+        close(fd); c.tcp_backoff = 15;
+    }
+}
+
+// Send object/player RENDERING data to each client over its TCP stream
 // (handled by the x4mp_stream extension on the client).
 static void net_send_stream(const char* msg) {
+    size_t len = strlen(msg);
     for (auto& c : g_clients) {
-        struct sockaddr_in sa = c.addr;
-        sa.sin_port = htons(c.stream_port);
-        net_send(&sa, msg);
+        net_send_tcp(c, msg, len);
         if (g_debug && (g_net_tick % 300) == 0) {
             char dbg[160];
             snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST stream->%s:%u len=%zu",
-                     inet_ntoa(c.addr.sin_addr), (unsigned)c.stream_port, strlen(msg));
+                     inet_ntoa(c.addr.sin_addr), (unsigned)c.stream_port, len);
             net_debug(dbg);
         }
     }
@@ -281,6 +431,7 @@ struct ZoneObj {
     char faction[80];
     char macro[160];
     char sector_macro[160]; // sector MACRO name (client maps it to its own sector)
+    UniverseID sector = 0;  // host sector id (per-sector index key)
     // Delta-compression state: last position sent to clients. We only re-send
     // an object if it moved beyond g_delta_m (or a periodic full refresh).
     float last_x = 0, last_y = 0, last_z = 0;
@@ -288,9 +439,25 @@ struct ZoneObj {
 };
 static std::vector<ZoneObj> g_zone_objs;
 static unsigned long long g_zone_objs_zone = 0;
+// Host: per-sector index into g_zone_objs (rebuilt on every maintenance pass).
+// Pointers are valid until the next maintenance pass.
+static std::unordered_map<UniverseID, std::vector<ZoneObj*>> g_sector_ship_index;
+// When the sector index was last rebuilt. Used to gate the empty-FULL send: an
+// empty sector snapshot is only authoritative once the index has been rebuilt
+// since the client's sector changed (otherwise a not-yet-indexed sector looks
+// empty and the client would prune its whole local sector).
+static std::chrono::steady_clock::time_point g_last_index_rebuild{};
+// Host: persistent ship macro cache (id -> macro). A ship's macro never
+// changes, so the expensive Lua lookup happens once per ship, not every 5s.
+static std::unordered_map<UniverseID, std::string> g_ship_macro_cache;
+// Host: host-only objects (simulation satellites, client ghost ships) that
+// must never be streamed to clients — they do not exist in the clients' saves.
+static std::unordered_set<UniverseID> g_host_only_objects;
 
 // Network performance tuning.
-static int    g_update_interval = 3;   // frames between state sends (3 = 20Hz; client interpolates)
+static int    g_update_interval = 1;   // frames between state sends (1 = full tick rate ~20Hz;
+                                       // at highway speeds 15km/s a slower rate means the
+                                       // streamed positions are km stale)
 static float  g_delta_m = 0.5f;        // min movement (meters) to re-send an object
 static float  g_relevance_m = 20000.0f; // only stream objects within this radius of the host player
 static int    g_full_refresh_interval = 120; // frames between forced full refreshes
@@ -328,12 +495,19 @@ static void net_send_snapshot_host() {
         if (pship) {
             UIPosRot ppos = g_game->GetObjectPositionInSector(pship);
             char pmacro[160]; get_macro(pship, pmacro, sizeof(pmacro));
-            char relay[320];
+            // Sector macro so the client renders the ghost in the correct
+            // (mapped) sector and only when it is actually there.
+            char psecmacro[160] = {0};
+            if (g_game->GetContextByClass) {
+                UniverseID psec = g_game->GetContextByClass(pship, "sector", false);
+                if (psec) get_macro(psec, psecmacro, sizeof(psecmacro));
+            }
+            char relay[360];
             // The host's ghost is rendered on clients under the dedicated
             // "x4mp_host" faction so it is never confused with a client ship.
-            snprintf(relay, sizeof(relay), "PLAYER 0 %.3f %.3f %.3f %.3f %.3f %.3f %s x4mp_host\n",
+            snprintf(relay, sizeof(relay), "PLAYER 0 %.3f %.3f %.3f %.3f %.3f %.3f %s x4mp_host %s\n",
                      ppos.x, ppos.y, ppos.z, ppos.yaw, ppos.pitch, ppos.roll,
-                     pmacro[0] ? pmacro : "?");
+                     pmacro[0] ? pmacro : "?", psecmacro[0] ? psecmacro : "?");
             net_send_stream(relay); // -> client's stream port (x4mp_stream)
         }
     }
@@ -508,13 +682,64 @@ static void client_receive_thread(int port) {
 // STATIONS are intentionally NOT streamed: the client loads the SAME (synced)
 // save, so it keeps its own stations which preserve sector ownership/claims.
 // Streaming stations too would duplicate them on the client.
-static void net_refresh_zone_objects() {
+// Find a host-side client entry by address, or return nullptr.
+static NetClient* find_client(const struct sockaddr_in& from);
+
+// HOST: simulation maintenance pass (runs every ~5s while hosting).
+//
+// 1. Rebuilds the HIGH-SIMULATION sector set: the server player's sector plus
+//    every connected client's current sector. Ships in these sectors are
+//    ActivateObject()'d so they are FULLY simulated (high attention) even
+//    though the local player is not there — the same treatment the server
+//    player's own zone gets by default. This is what gives each connected
+//    client a fully simulated rendering zone on the host side.
+//    (X4MP_FULLSIM=1 instead activates EVERY ship — CPU-heavy, testing only.)
+// 2. Places a player-owned simulation satellite in each high-simulation
+//    sector (once) so the game keeps it active.
+// 3. Keeps the sector macro map fresh (client sector placement) and, when
+//    X4MP_STREAMSHIPS=1, the stream cache that feeds the OBJ broadcast.
+static void net_maintain_universe() {
     if (!g_game || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
+    if (!g_game->GetPlayerObjectID || !g_game->GetContextByClass) return;
+
     g_zone_objs.clear();
     g_zone_objs_zone = 0;
-    // The host's own player ship is streamed separately via PLAYER cid=0, so
-    // exclude it from the OBJ stream to avoid duplicate ghosts on the client.
-    UniverseID host_player = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
+
+    // --- high-simulation sector set: server player + all connected clients ---
+    g_highsim_sectors.clear();
+    UniverseID host_player = g_game->GetPlayerObjectID();
+    if (host_player) {
+        UniverseID hp_sector = g_game->GetContextByClass(host_player, "sector", false);
+        if (hp_sector) g_highsim_sectors.insert(hp_sector);
+    }
+    // Prune client ship state for clients that are no longer connected, and
+    // add each live client's sector to the high-simulation set.
+    for (auto it = g_client_ship_state.begin(); it != g_client_ship_state.end();) {
+        struct sockaddr_in ca; memset(&ca, 0, sizeof(ca));
+        ca.sin_family = AF_INET;
+        ca.sin_addr.s_addr = (uint32_t)(it->first >> 16);           // network order
+        ca.sin_port = htons((uint16_t)(it->first & 0xffff));        // host -> network
+        if (!find_client(ca)) {
+            // Client is gone: remove its orphaned ghost ship from the host
+            // universe (otherwise the old ship lingers after a reconnect).
+            auto shipit = g_client_ships.find(it->first);
+            if (shipit != g_client_ships.end()) {
+                if (g_game->IsValidComponent && g_game->IsValidComponent(shipit->second))
+                    g_game->RemoveComponent(shipit->second);
+                g_client_ships.erase(shipit);
+            }
+            it = g_client_ship_state.erase(it);
+            continue;
+        }
+        if (it->second.host_sector) g_highsim_sectors.insert(it->second.host_sector);
+        ++it;
+    }
+
+    // Deduplicate sector macro lookups within this pass (Lua calls are
+    // expensive): ~140 unique sectors instead of one per ship.
+    std::unordered_map<UniverseID, std::string> sector_macro_cache;
+    uint32_t total_ships = 0;
+
     const char* factions[64];
     uint32_t nf = g_game->GetAllFactions(factions, 64, true);
     for (uint32_t f = 0; f < nf; f++) {
@@ -523,22 +748,52 @@ static void net_refresh_zone_objects() {
         for (uint32_t i = 0; i < ns; i++) {
             UniverseID obj = ships[i];
             if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
-            if (host_player && obj == host_player) continue; // skip host player ship
-            UniverseID sector = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "sector", false) : 0;
+            if (host_player && obj == host_player) continue; // streamed via PLAYER cid=0
+            if (g_host_only_objects.count(obj)) continue;    // satellites / client ghosts
+            total_ships++;
+            UniverseID sector = g_game->GetContextByClass(obj, "sector", false);
             if (sector == 0) continue;
-            ZoneObj zo; zo.id = obj;
+            // High simulation for this sector? (server player or a client is here)
+            bool highsim = g_fullsim || g_highsim_sectors.count(sector) > 0;
+            if (highsim && g_game->ActivateObject) g_game->ActivateObject(obj, true);
+            // Player-owned satellite in each high-simulation sector (once).
+            if (highsim && g_game->SpawnObjectAtPos2 && g_sat_sectors.insert(sector).second) {
+                UIPosRot sp; std::memset(&sp, 0, sizeof(sp));
+                g_game->SpawnObjectAtPos2("eq_arg_satellite_01_macro", sector, sp, "player");
+            }
+            // Sector macro map (client sector placement + high-sim set).
+            auto scm = sector_macro_cache.find(sector);
+            if (scm == sector_macro_cache.end()) {
+                char sm[160]; get_macro(sector, sm, sizeof(sm));
+                scm = sector_macro_cache.emplace(sector, std::string(sm[0] ? sm : "?")).first;
+            }
+            if (scm->second[0] && scm->second[0] != '?') g_host_sector_by_macro[scm->second] = sector;
+            // Stream cache (always kept: the per-client zone sync stream and
+            // the legacy full broadcast both read from it).
+            ZoneObj zo; zo.id = obj; zo.sector = sector;
             snprintf(zo.faction, sizeof(zo.faction), "%s", factions[f] ? factions[f] : "player");
-            char macro[160]; get_macro(obj, macro, sizeof(macro));
-            snprintf(zo.macro, sizeof(zo.macro), "%s", macro[0] ? macro : "?");
-            char sm[160]; get_macro(sector, sm, sizeof(sm));
-            snprintf(zo.sector_macro, sizeof(zo.sector_macro), "%s", sm[0] ? sm : "?");
+            auto msc = g_ship_macro_cache.find(obj);
+            if (msc != g_ship_macro_cache.end()) {
+                snprintf(zo.macro, sizeof(zo.macro), "%s", msc->second.c_str());
+            } else {
+                char macro[160]; get_macro(obj, macro, sizeof(macro));
+                const char* m = macro[0] ? macro : "?";
+                snprintf(zo.macro, sizeof(zo.macro), "%s", m);
+                g_ship_macro_cache[obj] = m;
+            }
+            snprintf(zo.sector_macro, sizeof(zo.sector_macro), "%s", scm->second.c_str());
             g_zone_objs.push_back(zo);
         }
     }
+    // Rebuild the per-sector index (pointers into g_zone_objs, valid until
+    // the next maintenance pass).
+    g_sector_ship_index.clear();
+    for (auto& zo : g_zone_objs) g_sector_ship_index[zo.sector].push_back(&zo);
+    g_last_index_rebuild = std::chrono::steady_clock::now();
     if (g_debug) {
-        char dbg[200];
-        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST refreshed ALL ships: %zu (stations kept client-side)",
-                 g_zone_objs.size());
+        char dbg[220];
+        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST refreshed ALL ships: %u (highsim sectors: %zu, streamed: %zu)",
+                 total_ships, g_highsim_sectors.size(), g_zone_objs.size());
         net_debug(dbg);
     }
 }
@@ -554,6 +809,69 @@ static void net_send_obj_batch(const char* batch, size_t len) {
     memcpy(tmp, batch, n);
     tmp[n] = 0;
     net_send_stream(tmp);
+}
+
+// Send a filled OBJ batch to ONE client over its TCP stream.
+static void net_send_obj_batch_to(NetClient* c, const char* batch, size_t len) {
+    if (len == 0) return;
+    char tmp[60000];
+    size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+    memcpy(tmp, batch, n);
+    tmp[n] = 0;
+    net_send_tcp(*c, tmp, n);
+}
+
+// HOST: stream the ships in ONE client's current sector (per-client sync).
+//
+// This is the reconciliation feed: the client binds these ships to its own
+// locally simulated ships and corrects them, so every client (and the host)
+// shows the same positions. A FULL sector snapshot is sent when the client
+// joins or changes sector (c.needs_full); afterwards only ships that moved
+// beyond g_delta_m are re-sent (per-client delta state).
+static void net_send_client_objects(NetClient& c) {
+    if (!c.cur_sector) return;
+    auto sit = g_sector_ship_index.find(c.cur_sector);
+    if (sit == g_sector_ship_index.end() || sit->second.empty()) {
+        // No streamable ships in this sector: still send an (empty) FULL
+        // snapshot so the client can prune local ships that died on the host.
+        // But ONLY once the index has been rebuilt since this client's sector
+        // changed — a not-yet-indexed sector looks empty and would otherwise
+        // make the client prune its entire local sector.
+        bool index_current = (g_last_index_rebuild >= c.cur_sector_set_time);
+        if (c.needs_full && !g_zone_objs.empty() && index_current) {
+            c.needs_full = false;
+            net_send_obj_batch_to(&c, "FULL 1\n", 7);
+        }
+        return;
+    }
+
+    char batch[60000];
+    size_t used = 0;
+    // Always send the COMPLETE sector state every tick. LAN bandwidth is cheap,
+    // and a full authoritative snapshot every tick keeps the client's view
+    // exact — no delta-compression staleness to cause prune/respawn flicker.
+    const char* full = "FULL 1\n";
+    memcpy(batch, full, 6);
+    used = 6;
+    for (ZoneObj* zo : sit->second) {
+        UniverseID obj = (UniverseID)zo->id;
+        if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
+        UIPosRot pos = g_game->GetObjectPositionInSector(obj);
+        char buf[200];
+        int n = snprintf(buf, sizeof(buf),
+                         "OBJ %llu %s %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
+                         (unsigned long long)obj, zo->sector_macro,
+                         pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.roll,
+                         zo->faction, zo->macro);
+        if (used + (size_t)n >= sizeof(batch)) {
+            net_send_obj_batch_to(&c, batch, used);
+            used = 0;
+        }
+        memcpy(batch + used, buf, (size_t)n);
+        used += (size_t)n;
+    }
+    if (used > 0) net_send_obj_batch_to(&c, batch, used);
+    c.needs_full = false; // complete state sent this tick; reset the flag
 }
 
 static void net_send_objects_host() {
@@ -806,10 +1124,12 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 NetClient nc;
                 nc.addr = from;
                 nc.last_seen = std::chrono::steady_clock::now();
+                // Assign this client a UNIQUE, never-reused player faction so
+                // it is distinguishable from the host and from every other
+                // client (supports many simultaneous clients, e.g. 8).
+                nc.id = g_next_client_id++;
                 g_clients.push_back(nc);
-                // Assign this client a UNIQUE player faction so it is
-                // distinguishable from the host and from every other client.
-                int id = (int)g_clients.size();
+                int id = nc.id;
                 client_faction_for(id, g_clients.back().faction, sizeof(g_clients.back().faction));
                 // A brand-new client has no objects yet, so force a full object
                 // stream (clear delta state) so it gets the complete zone.
@@ -827,7 +1147,7 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 // refresh liveness and re-send WELCOME so the client can
                 // re-establish its session id.
                 c->last_seen = std::chrono::steady_clock::now();
-                int id = (int)(c - g_clients.data()) + 1;
+                int id = c->id;
                 char resp[64];
                 snprintf(resp, sizeof(resp), "WELCOME %d\n", id);
                 net_send(&from, resp);
@@ -861,51 +1181,112 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
             sscanf(msg + 6, "%d", &port);
             NetClient* c = find_client(from);
             if (c && port > 0 && port < 65535) c->stream_port = (uint16_t)port;
+        } else if (strncmp(msg, "ACT", 3) == 0) {
+            // Client ACTION (player-action replication channel). The client
+            // reports an action it performed (fire/build/trade/board); the host
+            // will execute it authoritatively and broadcast the result. Transport
+            // is in place; per-action execution is added incrementally. Log every
+            // received action for now (it is low-rate: only on real actions).
+            NetClient* c = find_client(from);
+            if (c) c->last_seen = std::chrono::steady_clock::now();
+            char lbuf[256];
+            snprintf(lbuf, sizeof(lbuf), "x4mp: [ACT] from %s (id=%d): %s",
+                     inet_ntoa(from.sin_addr), c ? c->id : -1, msg);
+            net_log(lbuf);
         } else if (strncmp(msg, "PLAYER", 6) == 0) {
-            // Client reports its ship: PLAYER <x> <y> <z> <yaw> <pitch> <roll> <macro>
-            // 1) spawn/update a ghost on the host (so the host SEES the client),
-            // 2) relay the client's ship to all OTHER clients (so clients see
-            //    each other). Host's own ship is already streamed via SNAP/OBJ.
-            float x, y, z, yaw, pitch, roll; char macro[160];
-            if (sscanf(msg, "PLAYER %f %f %f %f %f %f %159s",
-                       &x, &y, &z, &yaw, &pitch, &roll, macro) == 7) {
+            // Client reports its ship: PLAYER <x> <y> <z> <yaw> <pitch> <roll> <macro> [sector_macro]
+            // 1) place a ghost in the client's ACTUAL sector (mapped to host),
+            // 2) move the host player into that sector so the game fully simulates it,
+            // 3) relay the client's ship to all OTHER clients.
+            float x, y, z, yaw, pitch, roll; char macro[160], csector[160] = {0};
+            if (sscanf(msg, "PLAYER %f %f %f %f %f %f %159s %159s",
+                       &x, &y, &z, &yaw, &pitch, &roll, macro, csector) >= 7) {
                 uint64_t key = ((uint64_t)from.sin_addr.s_addr << 16) | (uint32_t)ntohs(from.sin_port);
                 ClientShipState& st = g_client_ship_state[key];
                 st.x = x; st.y = y; st.z = z; st.yaw = yaw; st.pitch = pitch; st.roll = roll;
                 snprintf(st.macro, sizeof(st.macro), "%s", macro[0] ? macro : "?");
+                if (csector[0]) snprintf(st.sector_macro, sizeof(st.sector_macro), "%s", csector);
                 // This client's UNIQUE faction (assigned at JOIN). The host's own
                 // ship keeps the vanilla "player" faction, so every client ghost
                 // is distinguishable from the host and from every other client.
                 NetClient* sender = find_client(from);
                 const char* cfaction = (sender && sender->faction[0]) ? sender->faction : "player";
-                // Spawn/update the ghost on the host (host's player sector).
-                UniverseID sector = (g_game && g_game->GetPlayerZoneID && g_game->GetContextByClass)
-                    ? g_game->GetContextByClass(g_game->GetPlayerZoneID(), "sector", false) : 0;
+                // Determine the host's version of the client's sector. If the
+                // client sent a sector macro and we know it, use it (so the ghost
+                // is in the RIGHT sector). Otherwise fall back to the host's
+                // player sector (old behaviour).
+                UniverseID sector = 0;
+                if (st.sector_macro[0] && g_host_sector_by_macro.count(st.sector_macro))
+                    sector = g_host_sector_by_macro[st.sector_macro];
+                if (!sector && g_game && g_game->GetPlayerZoneID && g_game->GetContextByClass)
+                    sector = g_game->GetContextByClass(g_game->GetPlayerZoneID(), "sector", false);
+                st.host_sector = sector;
+                // Per-client sync stream: a sector change requires a fresh FULL
+                // snapshot of the new sector (delta state is per-sector).
+                if (sender && sector && sector != sender->cur_sector) {
+                    sender->cur_sector = sector;
+                    sender->needs_full = true;
+                    sender->cur_sector_set_time = std::chrono::steady_clock::now();
+                    sender->last_sent.clear();
+                }
                 UIPosRot pos; pos.x = x; pos.y = y; pos.z = z;
                 pos.yaw = yaw; pos.pitch = pitch; pos.roll = roll;
                 auto it = g_client_ships.find(key);
                 if (it == g_client_ships.end()) {
                     if (g_game && g_game->SpawnObjectAtPos2 && sector) {
                         UniverseID ship = g_game->SpawnObjectAtPos2(st.macro, sector, pos, cfaction);
-                        if (ship) g_client_ships[key] = ship;
-                        if (g_debug) { char dbg[240]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client ghost id=%llu macro=%s faction=%s", (unsigned long long)ship, st.macro, cfaction); net_debug(dbg); }
+                        if (ship) {
+                            g_client_ships[key] = ship;
+                            g_host_only_objects.insert(ship); // never stream ghosts back
+                        }
+                        if (g_debug) { char dbg[280]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client ghost id=%llu macro=%s sector=%s(%llu) faction=%s", (unsigned long long)ship, st.macro, st.sector_macro[0]?st.sector_macro:"?", (unsigned long long)sector, cfaction); net_debug(dbg); }
                     }
                 } else {
                     if (g_game && g_game->SetObjectSectorPos && sector)
                         g_game->SetObjectSectorPos(it->second, sector, pos);
                 }
+                // LEGACY (X4MP_TELEPORT=1): force the game to fully simulate the
+                // client's sector by moving the host player into it. Off by
+                // default — the high-simulation set (ActivateObject on the
+                // client's sector ships, see net_maintain_universe) achieves the
+                // same without teleporting the server player around.
+                if (g_teleport_enabled && sector && g_game && g_game->GetPlayerObjectID && 
+                    g_game->GetContextByClass && g_game->SetObjectSectorPos) {
+                    UniverseID host_player = g_game->GetPlayerObjectID();
+                    UniverseID host_cur_sector = host_player ? g_game->GetContextByClass(host_player, "sector", false) : 0;
+                    if (host_cur_sector != sector) {
+                        // Rate-limit: moving the host player (a teleport) stresses the
+                        // engine. If the client is flying fast through many sectors,
+                        // teleporting every update can crash the game. Only move at
+                        // most once per g_player_move_interval_ms.
+                        auto now = std::chrono::steady_clock::now();
+                        if (now - g_last_player_move > std::chrono::milliseconds(g_player_move_interval_ms)) {
+                            g_last_player_move = now;
+                            // Move the host player's SHIP directly (SetObjectSectorPos),
+                            // NOT the camera (MovePlayerToSectorPos). The host player is
+                            // docked, so MovePlayerToSectorPos only moves the camera and
+                            // the ship stays put. Moving the ship makes the client's
+                            // sector high-attention and lets the client see the host ship.
+                            g_game->SetObjectSectorPos(host_player, sector, pos);
+                            if (g_game->MovePlayerToSectorPos) g_game->MovePlayerToSectorPos(sector, pos);
+                            if (g_debug) { char dbg[280]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST moved player SHIP into client sector=%s(%llu) pos=(%.1f,%.1f,%.1f)", st.sector_macro[0]?st.sector_macro:"?", (unsigned long long)sector, x, y, z); net_debug(dbg); }
+                        } else if (g_debug) {
+                            char dbg[200]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST player move rate-limited (client sector=%s)", st.sector_macro[0]?st.sector_macro:"?"); net_debug(dbg);
+                        }
+                    }
+                }
                 // Relay to all OTHER clients (via their stream port), including
-                // this client's unique faction so they can render it correctly.
-                char relay[320];
+                // this client's unique faction and sector macro so they can
+                // render the ghost in the correct sector.
+                char relay[360];
                 int rn = snprintf(relay, sizeof(relay),
-                                  "PLAYER %llu %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
-                                  (unsigned long long)key, x, y, z, yaw, pitch, roll, st.macro, cfaction);
+                                  "PLAYER %llu %.3f %.3f %.3f %.3f %.3f %.3f %s %s %s\n",
+                                  (unsigned long long)key, x, y, z, yaw, pitch, roll, st.macro, cfaction,
+                                  st.sector_macro[0] ? st.sector_macro : "?");
                 (void)rn;
                 for (auto& c : g_clients) {
                     if (c.addr.sin_port == from.sin_port && c.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
-                    struct sockaddr_in sa = c.addr;
-                    sa.sin_port = htons(c.stream_port);
-                    net_send(&sa, relay);
+                    net_send_tcp(c, relay, strlen(relay));
                 }
             }
         }
@@ -1050,21 +1431,36 @@ static void net_update() {
             snprintf(buf, sizeof(buf), "PING %u\n", g_net_tick);
             net_send_host(buf);
         }
+        // Simulation maintenance (high-simulation set, per-sector activation,
+        // sector macro map, stream cache): every ~5s while hosting, regardless
+        // of whether the OBJ broadcast is enabled.
+        if ((g_net_tick % 300) == 0) net_maintain_universe();
+        // Maintain per-client TCP stream connections (connect / reconnect).
+        for (auto& c : g_clients) net_client_tcp(c);
         // Rate-limit state streaming: only send SNAP/OBJ every g_update_interval
         // frames (default 15 Hz instead of every frame at 60fps). This cuts
         // bandwidth and CPU by ~4x with no perceptible loss for a thin client.
         if (!g_clients.empty() && (g_net_tick % g_update_interval) == 0) {
             // Layer 2: stream a universe-state snapshot to clients.
             net_send_snapshot_host();
-            // Layer 2: stream objects in the player's zone.
-            if (g_objmode == "full") {
-                // FULL mode: enumerate + stream every frame (no cache).
-                net_send_objects_host_full();
+            // Layer 2: stream ships.
+            if (g_stream_ships) {
+                // Legacy: full-universe broadcast to all clients (testing).
+                if (g_objmode == "full") {
+                    // FULL mode: enumerate + stream every frame (no cache).
+                    net_send_objects_host_full();
+                } else {
+                    // CACHE mode: stream positions from the maintenance cache
+                    // (with delta compression).
+                    net_send_objects_host();
+                }
             } else {
-                // CACHE mode: refresh the zone-object cache at low frequency,
-                // then stream positions from the cache (with delta compression).
-                if ((g_net_tick % 300) == 0) net_refresh_zone_objects();
-                net_send_objects_host();
+                // Default: per-client zone-limited sync stream. Each client
+                // receives the COMPLETE ships in ITS current sector every tick
+                // (full authoritative snapshot — no delta compression), which it
+                // binds to its own locally simulated ships (reconciliation —
+                // keeps all clients + host showing the same positions).
+                for (auto& c : g_clients) net_send_client_objects(c);
             }
         }
     } else if (g_net_client) {
@@ -1100,6 +1496,14 @@ static void net_update() {
                 char buf[128];
                 snprintf(buf, sizeof(buf), "INPUT tick=%u\n", g_net_tick);
                 net_send(&g_host_sa, buf);
+                // Test action channel (X4MP_TEST_ACTION=1): send a periodic ACT
+                // to validate the client->host action transport (the follow-up
+                // player-action replication). The host logs every ACT it receives.
+                if (g_test_action && g_client_ready && (g_net_tick % 300) == 0) {
+                    char abuf[64];
+                    snprintf(abuf, sizeof(abuf), "ACT test n=%u\n", g_net_tick);
+                    net_send(&g_host_sa, abuf);
+                }
                 // Send our ship state so the host (and other clients via relay)
                 // can see us. Only once we are in the universe with a valid ship.
                 if (g_client_ready && g_game && g_game->GetPlayerObjectID &&
@@ -1108,15 +1512,23 @@ static void net_update() {
                     if (ship) {
                         UIPosRot pos = g_game->GetObjectPositionInSector(ship);
                         char macro[160]; get_macro(ship, macro, sizeof(macro));
-                        char pbuf[256];
-                        snprintf(pbuf, sizeof(pbuf), "PLAYER %.3f %.3f %.3f %.3f %.3f %.3f %s\n",
+                        // Get our sector macro so the host can place our ghost in
+                        // the correct sector and move its player here (to force
+                        // simulation of this sector on the host).
+                        char csector[160] = {0};
+                        UniverseID player_zone = g_game->GetPlayerZoneID ? g_game->GetPlayerZoneID() : 0;
+                        UniverseID csec = (g_game->GetContextByClass && player_zone)
+                            ? g_game->GetContextByClass(player_zone, "sector", false) : 0;
+                        if (csec) get_macro(csec, csector, sizeof(csector));
+                        char pbuf[320];
+                        snprintf(pbuf, sizeof(pbuf), "PLAYER %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
                                  pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.roll,
-                                 macro[0] ? macro : "?");
+                                 macro[0] ? macro : "?", csector[0] ? csector : "?");
                         net_send(&g_host_sa, pbuf);
                         if (g_debug) {
-                            char dbg[300];
-                            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT sending PLAYER ship=%llu pos=(%.1f,%.1f,%.1f) macro=%s",
-                                     (unsigned long long)ship, pos.x, pos.y, pos.z, macro[0] ? macro : "?");
+                            char dbg[340];
+                            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT sending PLAYER ship=%llu pos=(%.1f,%.1f,%.1f) macro=%s sector=%s",
+                                     (unsigned long long)ship, pos.x, pos.y, pos.z, macro[0] ? macro : "?", csector[0] ? csector : "?");
                             net_debug(dbg);
                         }
                     }
@@ -1134,6 +1546,8 @@ static const int64_t   g_join_delay_ms = 20000;
 static void read_config() {
     const char* auto_mode = std::getenv("X4MP_AUTO");
     if (auto_mode) g_auto = auto_mode;
+    const char* ta = std::getenv("X4MP_TEST_ACTION");
+    if (ta && *ta == '1') g_test_action = true;
     const char* ip = std::getenv("X4MP_SERVER_IP");
     if (ip) g_server_ip = ip;
     const char* mod = std::getenv("X4MP_MODULE");
@@ -1154,7 +1568,7 @@ static void read_config() {
     const char* om = std::getenv("X4MP_OBJMODE");
     if (om && *om) g_objmode = om;
     const char* cl = std::getenv("X4MP_CLEANUP");
-    if (cl && *cl == '0') g_cleanup_enabled = false;
+    if (cl && *cl == '1') g_cleanup_enabled = true;  // default off: keep own ships
     const char* st = std::getenv("X4MP_STREAMS");
     if (st && *st) {
         int n = atoi(st);
@@ -1162,6 +1576,12 @@ static void read_config() {
     }
     const char* ps = std::getenv("X4MP_PAUSE");
     if (ps && *ps == '1') g_pause_enabled = true;
+    const char* fs = std::getenv("X4MP_FULLSIM");
+    if (fs && *fs == '1') g_fullsim = true;   // default off: high-sim set only
+    const char* tp = std::getenv("X4MP_TELEPORT");
+    if (tp && *tp == '1') g_teleport_enabled = true;
+    const char* ss = std::getenv("X4MP_STREAMSHIPS");
+    if (ss && *ss == '1') g_stream_ships = true;
     const char* ut = std::getenv("X4MP_UNIVERSE_TIMEOUT");
     if (ut && *ut) {
         long long v = atoll(ut);

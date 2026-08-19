@@ -71,6 +71,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
+#include <dirent.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -108,6 +109,20 @@ static bool            g_client_ready = false;  // thin client: in universe, rea
 // Follow-up (player-action replication): X4MP_TEST_ACTION=1 makes the client
 // send a periodic ACT message to the host to validate the action transport.
 static bool            g_test_action = false;
+// Test hook: X4MP_TEST_MENU=host|client simulates the in-game menu click after
+// a delay, so the menu-driven host/join flow can be verified without clicking.
+static bool            g_test_menu = false;
+static std::string     g_test_menu_role;   // "host" or "client"
+static std::chrono::steady_clock::time_point g_test_menu_time;
+static bool            g_test_menu_done = false;
+// PERF logging: write FPS + per-tick net_update cost to a file (X4MP_PERF_LOG,
+// default /tmp/x4mp_perf.log) every 2s, so the host's frame cost can be
+// diagnosed after a test run.
+static int             g_perf_frames = 0;
+static long long       g_perf_net_us = 0;     // accumulated net_update cost
+static int             g_perf_net_count = 0;  // number of net_updates measured
+static std::string     g_perf_log_path = "/tmp/x4mp_perf.log";
+static std::chrono::steady_clock::time_point g_perf_log_time;
 static bool            g_universe_ready = false; // universe fully built (2nd load pass done)
 static bool            g_game_loaded_fired = false; // client: on_game_loaded has fired (1st pass done)
 static std::chrono::steady_clock::time_point g_game_loaded_time; // when client's 1st pass completed
@@ -134,9 +149,21 @@ static bool            g_net_client = false;
 static bool            g_net_connected = false; // client: handshake done
 static bool            g_stream_reported = false; // client: told host our stream port
 static int             g_stream_port = 7778;   // client's dedicated stream port (x4mp_stream)
+// Consolidated TCP mode (client): g_sock is the TCP connection to the host.
+static bool            g_client_tcp_connecting = false; // non-blocking connect in progress
+static std::string     g_client_tcp_buf;                // accumulates partial lines from the host
 static uint16_t        g_net_port = 7777;
 static std::string     g_net_host_ip = "192.168.1.16";
 static struct sockaddr_in g_host_sa;
+// Data-stream transport: "tcp" (default) or "udp" (X4MP_TRANSPORT). The control
+// channel (7777) is always UDP; only the object data stream (7778) switches.
+static std::string     g_transport = "tcp";
+static int             g_stream_udp_sock = -1; // host: UDP socket for the data stream (legacy)
+// Consolidated one-port-per-transport mode (X4MP_LEGACY_NET=0): control + data
+// share a SINGLE connection (TCP 7778 or UDP 7777). Legacy (default) keeps the
+// current working setup (UDP 7777 control + TCP/UDP 7778 data).
+static bool            g_legacy_net = false; // DEFAULT: consolidated one-port mode (X4MP_LEGACY_NET=1 for the old split-port setup)
+static int             g_listen_sock = -1;     // host: TCP listening socket (new mode, 7778)
 
 // Host-side client tracking with liveness (for dead-client pruning).
 // Last position sent to one client (per-client delta compression).
@@ -158,13 +185,14 @@ struct NetClient {
     int  tcp_fd = -1;           // connected TCP fd (-1 = not connected)
     int  tcp_backoff = 0;       // ticks to wait before retrying the connect
     bool tcp_connecting = false;// non-blocking connect in progress
-    ~NetClient() { if (tcp_fd >= 0) close(tcp_fd); }
+    std::string tcp_recv_buf;   // (new mode) accumulates partial lines from c.tcp_fd
+    // NOTE: NO destructor that closes tcp_fd. NetClient is copied/moved inside
+    // g_clients (push_back + remove_if reallocation); a destructor close would
+    // free the fd while the vector's copy still references it -> EBADF on the
+    // next recv (the accept->drop->reconnect loop). tcp_fd is closed explicitly
+    // at the connection-error, prune, and shutdown sites instead.
 };
 
-// Unique faction id for a host-assigned client slot (1-based).
-static void client_faction_for(int id, char* out, size_t outsize) {
-    snprintf(out, outsize, "x4mp_client_%d", id);
-}
 static std::vector<NetClient> g_clients;
 // Monotonic client-id counter: ids are never reused, so a client that joins
 // after another is pruned cannot collide with the old client's faction/ghost.
@@ -173,6 +201,19 @@ static int g_next_client_id = 1;
 // Host-side representation of each connected client's ship (so the host can
 // SEE the client's ship). Key = hash of client sockaddr; value = spawned ship id.
 static std::unordered_map<uint64_t, UniverseID> g_client_ships;
+
+// Host-side ghost STATIONS built by each client after load (issue 3). The
+// save's stations already exist on both sides (same save); only post-load
+// builds are new. Key = hash of client sockaddr; value = spawned station ids
+// indexed by the client's ACT BUILD sequence number.
+static std::unordered_map<uint64_t, std::vector<UniverseID>> g_client_stations;
+// CLIENT: stations already reported to the host (baseline = the save's
+// stations at ready time, so only NEW builds are reported).
+static std::unordered_map<UniverseID, uint32_t> g_client_station_seq_map; // station -> stable seq
+static std::unordered_set<UniverseID> g_client_station_baseline; // the save's stations (never reported)
+static uint32_t g_client_station_seq = 0;
+static bool g_fleet_reassigned = false; // issue 4: reassignment completed
+static bool client_reassign_player_fleet(); // fwd (defined after net_update)
 
 // Host-side cached ship state per client, used to relay to other clients so
 // that clients can see each other. Key = hash of client sockaddr.
@@ -250,7 +291,178 @@ static void net_debug(const char* msg) {
     fflush(stdout);
 }
 
+// ---- Ghost factions ------------------------------------------------------------
+// Ghost ships (a client's player ship as seen on the host / other clients, and
+// the host's player ship as seen on clients) are spawned with SpawnObjectAtPos2,
+// which requires the owner faction to EXIST in the universe. The old design
+// invented fake factions ("x4mp_host", "x4mp_client_N") that were never
+// registered, so every ghost spawn failed with "Failed to retrieve owner
+// faction" and no player could ever see another player's ship.
+//
+// Both host and client load the SAME save, so every REAL faction exists on both
+// sides. We therefore assign each ghost a real faction, chosen deterministically
+// from the sorted real-faction list (excluding the vanilla "player" faction).
+// The sorted order is identical on every machine for the same save, so the host
+// and all clients agree on which faction a given ghost uses without extra
+// negotiation.
+static std::vector<std::string> g_real_factions; // sorted, "player" excluded
+static bool g_real_factions_built = false;
+
+static void ensure_real_factions() {
+    if (g_real_factions_built) return;
+    if (!g_game || !g_game->GetAllFactions) return;   // retry next call once loaded
+    g_real_factions_built = true;
+    const char* factions[128];
+    uint32_t nf = g_game->GetAllFactions(factions, 128, true);
+    for (uint32_t f = 0; f < nf; f++) {
+        if (!factions[f] || !factions[f][0]) continue;
+        if (strcmp(factions[f], "player") == 0) continue;
+        g_real_factions.push_back(factions[f]);
+    }
+    std::sort(g_real_factions.begin(), g_real_factions.end());
+    if (g_debug && !g_real_factions.empty()) {
+        char dbg[220];
+        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] %zu real factions for ghosts; F_HOST=%s",
+                 g_real_factions.size(), g_real_factions[0].c_str());
+        net_debug(dbg);
+    }
+}
+
+// The faction the local player is CURRENTLY piloting. In a campaign save the
+// player boards foreign ships (e.g. the Boron1 "alliance" ship), so this can
+// differ from "player". Ghost factions must never collide with it, or the
+// host's ghost ship would be indistinguishable from the client's own ship.
+static const char* player_piloted_faction() {
+    if (!g_game || !g_game->GetPlayerObjectID || !g_game->GetOwnerDetails2) return nullptr;
+    UniverseID p = g_game->GetPlayerObjectID();
+    if (!p) return nullptr;
+    auto od = g_game->GetOwnerDetails2(p);
+    return od.factionID;
+}
+
+// Deterministic ghost-faction picker. `id` = 0 for the host's own ship,
+// >= 1 for client slots. Skips the faction the player currently pilots so a
+// ghost is always visually distinct from the local player's own ship. Every
+// side computes the same choice (same save -> same faction list, same
+// piloted faction).
+static const std::string* pick_ghost_faction(int id) {
+    ensure_real_factions();
+    if (g_real_factions.empty()) return nullptr;
+    const char* piloted = player_piloted_faction();
+    int size = (int)g_real_factions.size();
+    for (int attempt = 0; attempt < size; attempt++) {
+        int idx = ((id + attempt) % size + size) % size;
+        const std::string& f = g_real_factions[idx];
+        if (piloted && strcmp(f.c_str(), piloted) == 0) continue;
+        return &f;
+    }
+    return &g_real_factions[0];
+}
+
+// The host's OWN player-ship ghost faction (deterministic, exists on all
+// sides). Returns "" while the universe (and thus the faction list) is not
+// ready yet — callers must defer, NOT fall back to "player" (which would make
+// a ghost appear as the local player's own ship).
+static const char* host_display_faction() {
+    const std::string* f = pick_ghost_faction(0);
+    return f ? f->c_str() : "";
+}
+
+// Real faction assigned to client slot `id` (1-based) for its player-ship
+// ghost. Same "" = universe not ready contract. MUST be called at
+// ghost-spawn/relay time, not at JOIN time: JOINs arrive during the host's
+// load passes, before the universe (and the faction list) exists.
+static void client_faction_for(int id, char* out, size_t outsize) {
+    const std::string* f = pick_ghost_faction(id);
+    snprintf(out, outsize, "%s", f ? f->c_str() : "");
+}
+
+// Enumerate ALL ships/stations of a faction with no arbitrary buffer cap.
+// The old code passed a fixed 2048-entry stack buffer; factions with more ships
+// silently lost the overflow, so the host's FULL snapshots were incomplete and
+// the client's missing-ship prune deleted ships that actually exist. We size
+// the buffer from GetNumAllFactionShips/Stations and heap-allocate.
+static uint32_t enumerate_faction_ships(const char* faction, std::vector<UniverseID>& out) {
+    if (!g_game || !g_game->GetAllFactionShips) return 0;
+    uint32_t cap = 4096;
+    if (g_game->GetNumAllFactionShips) cap = std::max<uint32_t>(cap, g_game->GetNumAllFactionShips(faction));
+    if (cap == 0) return 0;
+    out.resize(cap);
+    return g_game->GetAllFactionShips(out.data(), cap, faction);
+}
+static uint32_t enumerate_faction_stations(const char* faction, std::vector<UniverseID>& out) {
+    if (!g_game || !g_game->GetAllFactionStations) return 0;
+    uint32_t cap = 1024;
+    if (g_game->GetNumAllFactionStations) cap = std::max<uint32_t>(cap, g_game->GetNumAllFactionStations(faction));
+    if (cap == 0) return 0;
+    out.resize(cap);
+    return g_game->GetAllFactionStations(out.data(), cap, faction);
+}
+
+// DIAG: every close() of a socket we own goes through here so fd-table
+// changes are traceable in the log (site = where the close happened).
+static void net_close_fd(int fd, const char* site) {
+    if (fd < 0) return;
+    char m[128];
+    snprintf(m, sizeof(m), "x4mp: net: CLOSE fd=%d site=%s", fd, site);
+    net_log(m);
+    close(fd);
+}
+
+// DIAG: dump the process fd table (/proc/self/fd) so a silent fd death can be
+// correlated with what the fd number was/is.
+static void net_dump_fds(const char* why) {
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return;
+    std::string line;
+    struct dirent* e;
+    char path[64], tgt[512];
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+        ssize_t n = readlink(path, tgt, sizeof(tgt) - 1);
+        if (n > 0) tgt[n] = 0; else tgt[0] = 0;
+        line += std::string(e->d_name) + ":" + tgt + " ";
+    }
+    closedir(d);
+    char m[2048];
+    snprintf(m, sizeof(m), "x4mp: net: FD_TABLE (%s): %s", why, line.c_str());
+    net_log(m);
+}
+
 static bool net_init_host(uint16_t port) {
+    // Consolidated TCP mode (X4MP_LEGACY_NET=0, X4MP_TRANSPORT=tcp): bind a TCP
+    // LISTENER on the data port (7778). Clients CONNECT to us; we accept one
+    // connection per client and carry BOTH control and data on it. We do NOT
+    // open the legacy UDP control socket in this mode.
+    if (!g_legacy_net && g_transport == "tcp") {
+        uint16_t tport = (uint16_t)g_stream_port;
+        g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (g_listen_sock < 0) { net_log("x4mp: net: socket() failed"); return false; }
+        int one = 1;
+        setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        sa.sin_port = htons(tport);
+        if (bind(g_listen_sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            net_log("x4mp: net: bind() failed");
+            net_close_fd(g_listen_sock, "init_host_bind"); g_listen_sock = -1;
+            return false;
+        }
+        if (listen(g_listen_sock, 8) < 0) {
+            net_log("x4mp: net: listen() failed");
+            net_close_fd(g_listen_sock, "init_host_listen"); g_listen_sock = -1;
+            return false;
+        }
+        int fl = fcntl(g_listen_sock, F_GETFL, 0);
+        fcntl(g_listen_sock, F_SETFL, fl | O_NONBLOCK);
+        g_net_host = true;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "x4mp: net: HOST listening on TCP port %u (consolidated control+data)", (unsigned)tport);
+        net_log(buf);
+        return true;
+    }
     g_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_sock < 0) { net_log("x4mp: net: socket() failed"); return false; }
     int one = 1;
@@ -261,7 +473,7 @@ static bool net_init_host(uint16_t port) {
     sa.sin_port = htons(port);
     if (bind(g_sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         net_log("x4mp: net: bind() failed");
-        close(g_sock); g_sock = -1;
+        net_close_fd(g_sock, "init_host_udp_bind"); g_sock = -1;
         return false;
     }
     int flags = fcntl(g_sock, F_GETFL, 0);
@@ -274,6 +486,35 @@ static bool net_init_host(uint16_t port) {
 }
 
 static bool net_init_client(const char* ip, uint16_t port) {
+    // Consolidated TCP mode (X4MP_LEGACY_NET=0, tcp): g_sock is a TCP socket
+    // that CONNECTS to the host's data port (7778). Control + data ride it.
+    if (!g_legacy_net && g_transport == "tcp") {
+        uint16_t tport = (uint16_t)g_stream_port;
+        g_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (g_sock < 0) { net_log("x4mp: net: socket() failed"); return false; }
+        int fl = fcntl(g_sock, F_GETFL, 0);
+        fcntl(g_sock, F_SETFL, fl | O_NONBLOCK);
+        memset(&g_host_sa, 0, sizeof(g_host_sa));
+        g_host_sa.sin_family = AF_INET;
+        g_host_sa.sin_port = htons(tport);
+        if (inet_pton(AF_INET, ip, &g_host_sa.sin_addr) != 1) {
+            net_log("x4mp: net: invalid server IP");
+            net_close_fd(g_sock, "init_client_tcp_badip"); g_sock = -1;
+            return false;
+        }
+        int one = 1;
+        setsockopt(g_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        int r = connect(g_sock, (struct sockaddr*)&g_host_sa, sizeof(g_host_sa));
+        if (r == 0) g_client_tcp_connecting = false;
+        else if (errno == EINPROGRESS) g_client_tcp_connecting = true;
+        else { net_log("x4mp: net: connect() failed"); net_close_fd(g_sock, "init_client_tcp_connect"); g_sock = -1; return false; }
+        g_net_client = true;
+        g_client_last_recv = std::chrono::steady_clock::now();
+        char buf[128];
+        snprintf(buf, sizeof(buf), "x4mp: net: CLIENT connecting to %s:%u (consolidated TCP)", ip, (unsigned)tport);
+        net_log(buf);
+        return true;
+    }
     g_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_sock < 0) { net_log("x4mp: net: socket() failed"); return false; }
     memset(&g_host_sa, 0, sizeof(g_host_sa));
@@ -281,7 +522,7 @@ static bool net_init_client(const char* ip, uint16_t port) {
     g_host_sa.sin_port = htons(port);
     if (inet_pton(AF_INET, ip, &g_host_sa.sin_addr) != 1) {
         net_log("x4mp: net: invalid server IP");
-        close(g_sock); g_sock = -1;
+        net_close_fd(g_sock, "init_client_udp_badip"); g_sock = -1;
         return false;
     }
     int flags = fcntl(g_sock, F_GETFL, 0);
@@ -308,6 +549,33 @@ static void net_send_host(const char* msg) {
     for (auto& c : g_clients) net_send(&c.addr, msg);
 }
 
+// CLIENT: send a CONTROL message to the host. In the consolidated TCP mode
+// (X4MP_LEGACY_NET=0, tcp) it rides the TCP connection (g_sock); otherwise it
+// uses the legacy UDP control socket (7777). A full send buffer drops the tick
+// (the next tick resends) rather than stalling the game thread.
+static void net_send_client(const char* msg) {
+    if (!g_legacy_net && g_transport == "tcp") {
+        if (g_sock < 0 || g_client_tcp_connecting) return;
+        size_t len = strlen(msg);
+        size_t off = 0;
+        while (off < len) {
+            ssize_t w = send(g_sock, msg + off, len - off, MSG_NOSIGNAL);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+                char m[200];
+                snprintf(m, sizeof(m), "x4mp: net: CLIENT send error errno=%d (%s) — reconnecting", errno, strerror(errno));
+                net_log(m);
+                net_close_fd(g_sock, "client_send_error"); g_sock = -1; g_net_connected = false;
+                return;
+            }
+            off += (size_t)w;
+        }
+    } else {
+        net_send(&g_host_sa, msg);
+    }
+}
+
 // HOST: send a batch over ONE client's TCP stream. Returns false on failure.
 // A real error (EPIPE/ECONNRESET) drops the connection so net_client_tcp()
 // reconnects next tick; a send-timeout just returns false (retry next tick).
@@ -319,12 +587,29 @@ static bool net_send_tcp(NetClient& c, const char* msg, size_t len) {
         if (w < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return false; // send timeout
-            close(c.tcp_fd); c.tcp_fd = -1; // real error (EPIPE/ECONNRESET)
+            char m[200];
+            snprintf(m, sizeof(m), "x4mp: net: HOST send error id=%d fd=%d errno=%d (%s)", c.id, c.tcp_fd, errno, strerror(errno));
+            net_log(m);
+            if (errno == EBADF) net_dump_fds("send-EBADF");
+            net_close_fd(c.tcp_fd, "host_send_error"); c.tcp_fd = -1; // real error (EPIPE/ECONNRESET)
             return false;
         }
         off += (size_t)w;
     }
     return true;
+}
+
+// HOST: send a CONTROL message (WELCOME/PING/SNAP) to ONE client. In the
+// consolidated TCP mode (X4MP_LEGACY_NET=0, tcp) the control rides the same
+// per-client connection as the data (c.tcp_fd); otherwise it uses the legacy
+// UDP control socket (7777).
+static void net_send_ctrl(NetClient* c, const char* msg) {
+    if (!g_legacy_net && g_transport == "tcp") net_send_tcp(*c, msg, strlen(msg));
+    else net_send(&c->addr, msg);
+}
+// HOST: send a CONTROL message to ALL clients.
+static void net_send_ctrl_host(const char* msg) {
+    for (auto& c : g_clients) net_send_ctrl(&c, msg);
 }
 
 // HOST: maintain the per-client TCP stream connection. The client's x4mp_stream
@@ -336,17 +621,16 @@ static void net_client_tcp(NetClient& c) {
         int err = 0; socklen_t el = sizeof(err);
         if (getsockopt(c.tcp_fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) {
             c.tcp_connecting = false;
-            int fl = fcntl(c.tcp_fd, F_GETFL, 0);
-            fcntl(c.tcp_fd, F_SETFL, fl & ~O_NONBLOCK); // -> blocking
-            struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 250000; // send timeout
-            setsockopt(c.tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            // Keep the stream fd NON-BLOCKING: a full send buffer must return
+            // EAGAIN immediately (net_send_tcp drops the tick) rather than
+            // stalling the game's main thread (the 5-FPS killer).
             int one = 1; setsockopt(c.tcp_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             char m[128];
             snprintf(m, sizeof(m), "x4mp: net: TCP stream connected to %s:%u",
                      inet_ntoa(c.addr.sin_addr), (unsigned)c.stream_port);
             net_log(m);
         } else {
-            close(c.tcp_fd); c.tcp_fd = -1; c.tcp_connecting = false;
+            net_close_fd(c.tcp_fd, "net_client_tcp_verify_fail"); c.tcp_fd = -1; c.tcp_connecting = false;
             c.tcp_backoff = 15;
         }
         return;
@@ -361,9 +645,7 @@ static void net_client_tcp(NetClient& c) {
     sa.sin_port = htons(c.stream_port);
     int r = connect(fd, (struct sockaddr*)&sa, sizeof(sa));
     if (r == 0) {
-        fcntl(fd, F_SETFL, fl & ~O_NONBLOCK); // -> blocking
-        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 250000; // send timeout
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        // Keep the stream fd NON-BLOCKING (see the tcp_connecting branch above).
         int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         c.tcp_fd = fd;
         char m[128];
@@ -373,16 +655,20 @@ static void net_client_tcp(NetClient& c) {
     } else if (errno == EINPROGRESS) {
         c.tcp_fd = fd; c.tcp_connecting = true; // verify next tick
     } else {
-        close(fd); c.tcp_backoff = 15;
+        net_close_fd(fd, "net_client_tcp_connect_fail"); c.tcp_backoff = 15;
     }
 }
 
-// Send object/player RENDERING data to each client over its TCP stream
-// (handled by the x4mp_stream extension on the client).
+// Forward decl (defined later): UDP data-stream send to one client.
+static void net_send_udp_to(NetClient& c, const char* msg, size_t len);
+
+// Send object/player RENDERING data to each client over its data stream
+// (TCP or UDP; handled by the x4mp_stream extension on the client).
 static void net_send_stream(const char* msg) {
     size_t len = strlen(msg);
     for (auto& c : g_clients) {
-        net_send_tcp(c, msg, len);
+        if (g_transport == "udp") net_send_udp_to(c, msg, len);
+        else net_send_tcp(c, msg, len);
         if (g_debug && (g_net_tick % 300) == 0) {
             char dbg[160];
             snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST stream->%s:%u len=%zu",
@@ -486,7 +772,7 @@ static void net_send_snapshot_host() {
     snprintf(buf, sizeof(buf), "SNAP %llu %llu %.3f %.3f %.3f %.3f %.3f %.3f %u\n",
              (unsigned long long)player, (unsigned long long)zone,
              pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.roll, g_net_tick);
-    net_send_host(buf);
+    net_send_ctrl_host(buf);
     // Also relay the host's OWN ship to all clients (cid=0) so they can SEE
     // the server's player ship as a separate entity. (SNAP alone only moves the
     // client's camera when paused; this spawns a visible ghost of the host.)
@@ -502,12 +788,16 @@ static void net_send_snapshot_host() {
                 UniverseID psec = g_game->GetContextByClass(pship, "sector", false);
                 if (psec) get_macro(psec, psecmacro, sizeof(psecmacro));
             }
+            const char* hfaction = host_display_faction();
+            if (!hfaction[0]) return; // universe not ready — defer this tick
             char relay[360];
-            // The host's ghost is rendered on clients under the dedicated
-            // "x4mp_host" faction so it is never confused with a client ship.
-            snprintf(relay, sizeof(relay), "PLAYER 0 %.3f %.3f %.3f %.3f %.3f %.3f %s x4mp_host %s\n",
+            // The host's ghost is rendered on clients under a REAL faction
+            // (host_display_faction) so SpawnObjectAtPos2 succeeds and the
+            // client sees the host's ship as a foreign ship, NOT as its own
+            // player-faction ship.
+            snprintf(relay, sizeof(relay), "PLAYER 0 %.3f %.3f %.3f %.3f %.3f %.3f %s %s %s\n",
                      ppos.x, ppos.y, ppos.z, ppos.yaw, ppos.pitch, ppos.roll,
-                     pmacro[0] ? pmacro : "?", psecmacro[0] ? psecmacro : "?");
+                     pmacro[0] ? pmacro : "?", hfaction, psecmacro[0] ? psecmacro : "?");
             net_send_stream(relay); // -> client's stream port (x4mp_stream)
         }
     }
@@ -578,8 +868,8 @@ static void host_stream_thread(int port, bool ships) {
                 char batch[60000]; size_t used = 0;
                 for (uint32_t f = 0; f < nf; f++) {
                     if (ships) {
-                        UniverseID objs[2048];
-                        uint32_t no = g_game->GetAllFactionShips(objs, 2048, factions[f]);
+                        std::vector<UniverseID> objs;
+                        uint32_t no = enumerate_faction_ships(factions[f], objs);
                         for (uint32_t i = 0; i < no; i++) {
                             UniverseID obj = objs[i];
                             UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
@@ -595,8 +885,8 @@ static void host_stream_thread(int port, bool ships) {
                             if (used + (size_t)nn < sizeof(batch)) { memcpy(batch + used, b2, (size_t)nn); used += (size_t)nn; }
                         }
                     } else if (g_game->GetAllFactionStations) {
-                        UniverseID objs[2048];
-                        uint32_t no = g_game->GetAllFactionStations(objs, 2048, factions[f]);
+                        std::vector<UniverseID> objs;
+                        uint32_t no = enumerate_faction_stations(factions[f], objs);
                         for (uint32_t i = 0; i < no; i++) {
                             UniverseID obj = objs[i];
                             UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
@@ -720,13 +1010,21 @@ static void net_maintain_universe() {
         ca.sin_addr.s_addr = (uint32_t)(it->first >> 16);           // network order
         ca.sin_port = htons((uint16_t)(it->first & 0xffff));        // host -> network
         if (!find_client(ca)) {
-            // Client is gone: remove its orphaned ghost ship from the host
-            // universe (otherwise the old ship lingers after a reconnect).
+            // Client is gone: remove its orphaned ghost ship AND ghost stations
+            // from the host universe (otherwise they linger after a reconnect).
             auto shipit = g_client_ships.find(it->first);
             if (shipit != g_client_ships.end()) {
                 if (g_game->IsValidComponent && g_game->IsValidComponent(shipit->second))
                     g_game->RemoveComponent(shipit->second);
                 g_client_ships.erase(shipit);
+            }
+            auto stnit = g_client_stations.find(it->first);
+            if (stnit != g_client_stations.end()) {
+                for (UniverseID stn : stnit->second) {
+                    if (stn && g_game->IsValidComponent && g_game->IsValidComponent(stn))
+                        g_game->RemoveComponent(stn);
+                }
+                g_client_stations.erase(stnit);
             }
             it = g_client_ship_state.erase(it);
             continue;
@@ -743,8 +1041,8 @@ static void net_maintain_universe() {
     const char* factions[64];
     uint32_t nf = g_game->GetAllFactions(factions, 64, true);
     for (uint32_t f = 0; f < nf; f++) {
-        UniverseID ships[2048];
-        uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
+        std::vector<UniverseID> ships;
+        uint32_t ns = enumerate_faction_ships(factions[f], ships);
         for (uint32_t i = 0; i < ns; i++) {
             UniverseID obj = ships[i];
             if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
@@ -811,14 +1109,36 @@ static void net_send_obj_batch(const char* batch, size_t len) {
     net_send_stream(tmp);
 }
 
-// Send a filled OBJ batch to ONE client over its TCP stream.
+// HOST: send a batch to ONE client over the UDP data stream (fire-and-forget;
+// a full buffer just drops the datagram — the next tick resends the full state).
+static void net_send_udp_to(NetClient& c, const char* msg, size_t len) {
+    // Consolidated UDP mode (X4MP_LEGACY_NET=0, udp): the data rides the SAME
+    // control socket (g_sock, 7777) as the control. Legacy UDP mode: the data
+    // uses a separate socket (g_stream_udp_sock, 7778).
+    int sock = g_legacy_net ? g_stream_udp_sock : g_sock;
+    if (sock < 0) return;
+    struct sockaddr_in sa = c.addr;
+    if (g_legacy_net) sa.sin_port = htons(c.stream_port); // 7778
+    // else: sa.sin_port stays c.addr.sin_port (7777, the control port)
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 60000) chunk = 60000;
+        ssize_t w = sendto(sock, msg + off, chunk, 0, (struct sockaddr*)&sa, sizeof(sa));
+        if (w < 0) { if (errno == EINTR) continue; break; } // drop on error (UDP)
+        off += (size_t)w;
+    }
+}
+
+// Send a filled OBJ batch to ONE client over its data stream (TCP or UDP).
 static void net_send_obj_batch_to(NetClient* c, const char* batch, size_t len) {
     if (len == 0) return;
     char tmp[60000];
     size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
     memcpy(tmp, batch, n);
     tmp[n] = 0;
-    net_send_tcp(*c, tmp, n);
+    if (g_transport == "udp") net_send_udp_to(*c, tmp, n);
+    else net_send_tcp(*c, tmp, n);
 }
 
 // HOST: stream the ships in ONE client's current sector (per-client sync).
@@ -938,8 +1258,8 @@ static void net_send_objects_host_full() {
     uint32_t nf = g_game->GetAllFactions(factions, 64, true);
     uint32_t total_seen = 0, total_streamed = 0;
     for (uint32_t f = 0; f < nf; f++) {
-        UniverseID ships[2048];
-        uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
+        std::vector<UniverseID> ships;
+        uint32_t ns = enumerate_faction_ships(factions[f], ships);
         for (uint32_t i = 0; i < ns; i++) {
             UniverseID obj = ships[i];
             total_seen++;
@@ -957,9 +1277,9 @@ static void net_send_objects_host_full() {
             net_send_stream(buf);
             total_streamed++;
         }
-        if (g_game->GetAllFactionStations) {
-            UniverseID stations[2048];
-            uint32_t nst = g_game->GetAllFactionStations(stations, 2048, factions[f]);
+        {
+            std::vector<UniverseID> stations;
+            uint32_t nst = enumerate_faction_stations(factions[f], stations);
             for (uint32_t i = 0; i < nst; i++) {
                 UniverseID obj = stations[i];
                 total_seen++;
@@ -1079,16 +1399,29 @@ static void thin_client_render_objects() {
 static void thin_client_cleanup_own_objects() {
     if (!g_game || g_cleanup_done) return;
     if (!g_game->RemoveComponent || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
-    UniverseID player_ship = g_game->GetPlayerControlledShipID ? g_game->GetPlayerControlledShipID() : 0;
+    // Never remove the player's own ship — in ANY state (flying, docked, in a
+    // hangar). GetPlayerControlledShipID returns 0 for a DOCKED player, so the
+    // old single-ID exclusion would delete the docked player ship ->
+    // "Game Over (killmethod=removed)" -> menu -> save-reload loop.
+    UniverseID pids[5] = {0, 0, 0, 0, 0};
+    pids[0] = g_game->GetPlayerControlledShipID ? g_game->GetPlayerControlledShipID() : 0;
+    pids[1] = g_game->GetPlayerShipID ? g_game->GetPlayerShipID() : 0;
+    pids[2] = g_game->GetPlayerOccupiedShipID ? g_game->GetPlayerOccupiedShipID() : 0;
+    pids[3] = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
+    pids[4] = (pids[3] && g_game->GetContextByClass) ? g_game->GetContextByClass(pids[3], "ship", false) : 0;
+    auto is_player = [&](UniverseID s) {
+        for (int i = 0; i < 5; i++) if (pids[i] && pids[i] == s) return true;
+        return false;
+    };
     const char* factions[64];
     uint32_t nf = g_game->GetAllFactions(factions, 64, true);
     uint32_t removed = 0, total_ships = 0;
     for (uint32_t f = 0; f < nf; f++) {
-        UniverseID ships[2048];
-        uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
+        std::vector<UniverseID> ships;
+        uint32_t ns = enumerate_faction_ships(factions[f], ships);
         total_ships += ns;
         for (uint32_t i = 0; i < ns; i++) {
-            if (ships[i] == player_ship) continue;
+            if (is_player(ships[i])) continue;
             g_game->RemoveComponent(ships[i]);
             removed++;
         }
@@ -1098,8 +1431,8 @@ static void thin_client_cleanup_own_objects() {
     if (g_debug) {
         char dbg[200];
         snprintf(dbg, sizeof(dbg),
-                 "x4mp: [DBG] CLIENT cleanup: %u factions, %u ships, removed %u ships (kept player ship %llu; stations kept)",
-                 nf, total_ships, removed, (unsigned long long)player_ship);
+                 "x4mp: [DBG] CLIENT cleanup: %u factions, %u ships, removed %u ships (kept player ships [%llu..%llu]; stations kept)",
+                 nf, total_ships, removed, (unsigned long long)pids[0], (unsigned long long)pids[4]);
         net_debug(dbg);
     }
 }
@@ -1150,7 +1483,7 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 int id = c->id;
                 char resp[64];
                 snprintf(resp, sizeof(resp), "WELCOME %d\n", id);
-                net_send(&from, resp);
+                net_send_ctrl(c, resp);
             }
         } else if (strncmp(msg, "INPUT", 5) == 0) {
             // Client input/command received. Refresh liveness; log occasionally.
@@ -1186,9 +1519,45 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
             // reports an action it performed (fire/build/trade/board); the host
             // will execute it authoritatively and broadcast the result. Transport
             // is in place; per-action execution is added incrementally. Log every
-            // received action for now (it is low-rate: only on real actions).
+            // received action (it is low-rate: only on real actions).
             NetClient* c = find_client(from);
             if (c) c->last_seen = std::chrono::steady_clock::now();
+            // ACT BUILD <seq> <macro> <x> <y> <z> <yaw> <pitch> <roll> <sector_macro>
+            // Issue 3: a station the client built after load. Spawn a ghost of
+            // it in the host's universe under the client's faction (so it never
+            // streams back to the building client, which already has it).
+            if (strncmp(msg + 4, "BUILD", 5) == 0 && g_game && g_game->SpawnObjectAtPos2) {
+                uint32_t seq; char macro[160], csector[160] = {0};
+                float x, y, z, yaw, pitch, roll;
+                if (sscanf(msg + 10, "%u %159s %f %f %f %f %f %f %159s",
+                           &seq, macro, &x, &y, &z, &yaw, &pitch, &roll, csector) >= 8) {
+                    UniverseID sector = 0;
+                    if (csector[0] && g_host_sector_by_macro.count(csector))
+                        sector = g_host_sector_by_macro[csector];
+                    if (!sector && g_game->GetPlayerZoneID && g_game->GetContextByClass)
+                        sector = g_game->GetContextByClass(g_game->GetPlayerZoneID(), "sector", false);
+                    uint64_t key = ((uint64_t)from.sin_addr.s_addr << 16) | (uint32_t)ntohs(from.sin_port);
+                    // Lazy faction computation (JOIN-time assignment is too
+                    // early — the universe may not exist yet).
+                    char cfaction[80];
+                    client_faction_for(c ? c->id : 1, cfaction, sizeof(cfaction));
+                    UIPosRot pos; pos.x = x; pos.y = y; pos.z = z;
+                    pos.yaw = yaw; pos.pitch = pitch; pos.roll = roll;
+                    std::vector<UniverseID>& spawned = g_client_stations[key];
+                    if ((int)spawned.size() <= (int)seq) spawned.resize((int)seq + 1, 0);
+                    if (spawned[seq] == 0 && sector && cfaction[0]) {
+                        UniverseID stn = g_game->SpawnObjectAtPos2(macro[0] ? macro : "?", sector, pos, cfaction);
+                        spawned[seq] = stn; // remember even if 0 (avoid spawn retry storms)
+                        if (stn) g_host_only_objects.insert(stn);
+                        if (g_debug) {
+                            char dbg[300];
+                            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client station ghost seq=%u id=%llu macro=%s sector=%llu faction=%s",
+                                     seq, (unsigned long long)stn, macro, (unsigned long long)sector, cfaction);
+                            net_debug(dbg);
+                        }
+                    }
+                }
+            }
             char lbuf[256];
             snprintf(lbuf, sizeof(lbuf), "x4mp: [ACT] from %s (id=%d): %s",
                      inet_ntoa(from.sin_addr), c ? c->id : -1, msg);
@@ -1206,11 +1575,12 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 st.x = x; st.y = y; st.z = z; st.yaw = yaw; st.pitch = pitch; st.roll = roll;
                 snprintf(st.macro, sizeof(st.macro), "%s", macro[0] ? macro : "?");
                 if (csector[0]) snprintf(st.sector_macro, sizeof(st.sector_macro), "%s", csector);
-                // This client's UNIQUE faction (assigned at JOIN). The host's own
-                // ship keeps the vanilla "player" faction, so every client ghost
-                // is distinguishable from the host and from every other client.
+                // This client's ghost faction — computed LAZILY here (not at
+                // JOIN, which arrives before the universe/faction list exist).
+                // "" = not ready yet: skip the spawn this tick, retry next.
                 NetClient* sender = find_client(from);
-                const char* cfaction = (sender && sender->faction[0]) ? sender->faction : "player";
+                char cfaction[80];
+                client_faction_for(sender ? sender->id : 1, cfaction, sizeof(cfaction));
                 // Determine the host's version of the client's sector. If the
                 // client sent a sector macro and we know it, use it (so the ghost
                 // is in the RIGHT sector). Otherwise fall back to the host's
@@ -1233,7 +1603,7 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 pos.yaw = yaw; pos.pitch = pitch; pos.roll = roll;
                 auto it = g_client_ships.find(key);
                 if (it == g_client_ships.end()) {
-                    if (g_game && g_game->SpawnObjectAtPos2 && sector) {
+                    if (g_game && g_game->SpawnObjectAtPos2 && sector && cfaction[0]) {
                         UniverseID ship = g_game->SpawnObjectAtPos2(st.macro, sector, pos, cfaction);
                         if (ship) {
                             g_client_ships[key] = ship;
@@ -1277,16 +1647,19 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 }
                 // Relay to all OTHER clients (via their stream port), including
                 // this client's unique faction and sector macro so they can
-                // render the ghost in the correct sector.
-                char relay[360];
-                int rn = snprintf(relay, sizeof(relay),
-                                  "PLAYER %llu %.3f %.3f %.3f %.3f %.3f %.3f %s %s %s\n",
-                                  (unsigned long long)key, x, y, z, yaw, pitch, roll, st.macro, cfaction,
-                                  st.sector_macro[0] ? st.sector_macro : "?");
-                (void)rn;
-                for (auto& c : g_clients) {
-                    if (c.addr.sin_port == from.sin_port && c.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
-                    net_send_tcp(c, relay, strlen(relay));
+                // render the ghost in the correct sector. Deferred (no relay)
+                // while the faction list is unavailable.
+                if (cfaction[0]) {
+                    char relay[360];
+                    int rn = snprintf(relay, sizeof(relay),
+                                      "PLAYER %llu %.3f %.3f %.3f %.3f %.3f %.3f %s %s %s\n",
+                                      (unsigned long long)key, x, y, z, yaw, pitch, roll, st.macro, cfaction,
+                                      st.sector_macro[0] ? st.sector_macro : "?");
+                    (void)rn;
+                    for (auto& c : g_clients) {
+                        if (c.addr.sin_port == from.sin_port && c.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
+                        net_send_tcp(c, relay, strlen(relay));
+                    }
                 }
             }
         }
@@ -1298,7 +1671,7 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
             net_log("x4mp: net: CONNECTED to host (handshake OK)");
         } else if (strncmp(msg, "PING", 4) == 0) {
             // Keepalive: answer so the host can confirm we are alive.
-            net_send(&g_host_sa, "PONG\n");
+            net_send_client("PONG\n");
         } else if (strncmp(msg, "PLAYER", 6) == 0) {
             // Host relayed another client's ship: PLAYER <cid> <x> <y> <z> <yaw> <pitch> <roll> <macro>
             // Spawn/update a ghost of that remote client in OUR player sector so
@@ -1363,6 +1736,138 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
 }
 
 static void net_poll() {
+    // Consolidated TCP mode (X4MP_LEGACY_NET=0, tcp): accept new client
+    // connections, then recv from each client's connection (control + data are
+    // multiplexed on it). We create the NetClient on ACCEPT (the connection is
+    // the identity); the JOIN line then just confirms it (sends WELCOME).
+    if (!g_legacy_net && g_transport == "tcp") {
+        if (g_net_host) {
+        if (g_listen_sock >= 0) {
+            for (;;) {
+                struct sockaddr_in from; socklen_t fl = sizeof(from);
+                int fd = accept(g_listen_sock, (struct sockaddr*)&from, &fl);
+                if (fd < 0) break; // no more pending (EWOULDBLOCK) or error
+                int one = 1;
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                int fl2 = fcntl(fd, F_GETFL, 0);
+                fcntl(fd, F_SETFL, fl2 | O_NONBLOCK);
+                // A reconnect from the same peer replaces its stale entry
+                // (same IP, new ephemeral port): close/erase any old entry for
+                // this peer so g_clients does not grow unbounded.
+                for (auto it = g_clients.begin(); it != g_clients.end(); ) {
+                    if (it->addr.sin_addr.s_addr == from.sin_addr.s_addr) {
+                        net_close_fd(it->tcp_fd, "accept_dedupe");
+                        it = g_clients.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                NetClient nc;
+                nc.addr = from;
+                nc.last_seen = std::chrono::steady_clock::now();
+                nc.id = g_next_client_id++;
+                nc.tcp_fd = fd;
+                client_faction_for(nc.id, nc.faction, sizeof(nc.faction));
+                g_clients.push_back(nc);
+                char lbuf[192];
+                snprintf(lbuf, sizeof(lbuf), "x4mp: net: client connected (id=%d, fd=%d, %s) faction=%s",
+                         nc.id, fd, inet_ntoa(from.sin_addr), nc.faction);
+                net_log(lbuf);
+                net_dump_fds("accept");
+            }
+        }
+        for (auto& c : g_clients) {
+            if (c.tcp_fd < 0) continue;
+            char buf[65536];
+            ssize_t n = 0;
+            while ((n = recv(c.tcp_fd, buf, sizeof(buf) - 1, 0)) > 0) {
+                buf[n] = 0;
+                c.tcp_recv_buf.append(buf, (size_t)n);
+            }
+            if (n == 0) {
+                // Peer (client) closed gracefully (FIN). Log it so we know the
+                // client initiated the drop.
+                char m[160];
+                snprintf(m, sizeof(m), "x4mp: net: HOST recv=0 (CLIENT closed) id=%d fd=%d", c.id, c.tcp_fd);
+                net_log(m);
+                net_close_fd(c.tcp_fd, "host_recv_eof"); c.tcp_fd = -1; c.tcp_recv_buf.clear();
+                continue;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                // Connection error: drop the fd.
+                char m[200];
+                snprintf(m, sizeof(m), "x4mp: net: HOST recv error id=%d fd=%d errno=%d (%s)", c.id, c.tcp_fd, errno, strerror(errno));
+                net_log(m);
+                net_close_fd(c.tcp_fd, "host_recv_error"); c.tcp_fd = -1; c.tcp_recv_buf.clear();
+                continue;
+            }
+            size_t start = 0;
+            for (;;) {
+                size_t nl = c.tcp_recv_buf.find('\n', start);
+                if (nl == std::string::npos) break;
+                c.tcp_recv_buf[nl] = 0;
+                if (nl > start) process_message(c.tcp_recv_buf.data() + start, c.addr);
+                start = nl + 1;
+            }
+            if (start > 0) c.tcp_recv_buf.erase(0, start);
+            if (c.tcp_recv_buf.size() > 4000000) c.tcp_recv_buf.clear();
+        }
+        } else if (g_net_client) {
+            // Client: recv from the host over the TCP connection (g_sock).
+            if (g_client_tcp_connecting) {
+                int err = 0; socklen_t el = sizeof(err);
+                if (getsockopt(g_sock, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) {
+                    g_client_tcp_connecting = false;
+                    net_log("x4mp: net: CLIENT TCP connected to host");
+                } else {
+                    return; // not connected yet; retry next tick
+                }
+            }
+            char buf[65536];
+            ssize_t n = 0;
+            while ((n = recv(g_sock, buf, sizeof(buf) - 1, 0)) > 0) {
+                buf[n] = 0;
+                g_client_tcp_buf.append(buf, (size_t)n);
+                g_client_last_recv = std::chrono::steady_clock::now();
+            }
+            if (n == 0) {
+                // Peer (host) closed gracefully (FIN).
+                net_log("x4mp: net: CLIENT recv=0 (HOST closed) — reconnecting");
+                net_close_fd(g_sock, "client_recv_eof"); g_sock = -1; g_client_tcp_buf.clear();
+                g_net_connected = false;
+                return;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                char m[200];
+                snprintf(m, sizeof(m), "x4mp: net: CLIENT recv error errno=%d (%s) — reconnecting", errno, strerror(errno));
+                net_log(m);
+                net_close_fd(g_sock, "client_recv_error"); g_sock = -1; g_client_tcp_buf.clear();
+                g_net_connected = false;
+                return;
+            }
+            size_t start = 0;
+            for (;;) {
+                size_t nl = g_client_tcp_buf.find('\n', start);
+                if (nl == std::string::npos) break;
+                g_client_tcp_buf[nl] = 0;
+                const char* line = g_client_tcp_buf.data() + start;
+                // Data lines (OBJ / PLAYER relay / FULL) -> x4mp_stream
+                // reconciliation. Control lines (WELCOME / PING) ->
+                // process_message. FULL must reach x4mp_stream: it marks a
+                // complete sector snapshot and gates convergence + pruning.
+                if (strncmp(line, "OBJ", 3) == 0 || strncmp(line, "PLAYER", 6) == 0 ||
+                    strncmp(line, "FULL", 4) == 0) {
+                    if (g_api && g_api->raise_event) g_api->raise_event("x4mp_stream.data", (void*)line);
+                } else {
+                    process_message(line, g_host_sa);
+                }
+                start = nl + 1;
+            }
+            if (start > 0) g_client_tcp_buf.erase(0, start);
+            if (g_client_tcp_buf.size() > 4000000) g_client_tcp_buf.clear();
+        }
+        return;
+    }
     if (g_sock < 0) return;
     char buf[65536];
     struct sockaddr_in from; socklen_t fromlen = sizeof(from);
@@ -1373,7 +1878,16 @@ static void net_poll() {
         char* save = nullptr;
         char* line = strtok_r(buf, "\n", &save);
         while (line) {
-            process_message(line, from);
+            // Consolidated UDP mode: data lines (OBJ/PLAYER) go to x4mp_stream
+            // (reconciliation); control lines (WELCOME/PING) to process_message.
+            // Legacy: every line goes to process_message (data arrives on 7778).
+            if (!g_legacy_net && g_transport == "udp" &&
+                (strncmp(line, "OBJ", 3) == 0 || strncmp(line, "PLAYER", 6) == 0 ||
+                 strncmp(line, "FULL", 4) == 0)) {
+                if (g_api && g_api->raise_event) g_api->raise_event("x4mp_stream.data", (void*)line);
+            } else {
+                process_message(line, from);
+            }
             line = strtok_r(nullptr, "\n", &save);
         }
     }
@@ -1382,14 +1896,24 @@ static void net_poll() {
 // Called each frame: poll incoming data + send periodic keepalive/snapshot.
 static void net_update() {
     net_poll();
-    if (g_sock < 0) return;
+    // New consolidated TCP mode: g_sock may be -1 (host: no UDP socket — it uses
+    // g_listen_sock; client: connection dropped). Don't bail early — the periodic
+    // send (host) and the reconnect logic (client) still need to run.
+    bool have_sock = (g_sock >= 0) || (!g_legacy_net && g_transport == "tcp");
+    if (!have_sock) return;
     g_net_tick++;
     if (g_net_host) {
         // Prune dead clients: remove any that have sent nothing for the timeout.
         if ((g_net_tick % 300) == 0 && !g_clients.empty()) {
             auto now = std::chrono::steady_clock::now();
             size_t before = g_clients.size();
-            g_clients.erase(std::remove_if(g_clients.begin(), g_clients.end(),
+            {
+                char dbg[160];
+                snprintf(dbg, sizeof(dbg), "x4mp: net: prune check (tick=%u): %zu entries",
+                         (unsigned)g_net_tick, g_clients.size());
+                net_log(dbg);
+            }
+            auto rit = std::remove_if(g_clients.begin(), g_clients.end(),
                 [&](const NetClient& c) {
                     // Never prune a client that is still loading its save
                     // (it cannot send data while the game is busy loading).
@@ -1397,12 +1921,29 @@ static void net_update() {
                     auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    now - c.last_seen).count();
                     return age > g_host_client_timeout_ms;
-                }), g_clients.end());
+                });
+            // Close the pruned clients' tcp_fd first (the destructor no longer
+            // does — see ~NetClient note), then erase them from the vector.
+            for (; rit != g_clients.end(); ++rit)
+                if (rit->tcp_fd >= 0) { net_close_fd(rit->tcp_fd, "prune"); rit->tcp_fd = -1; }
+            g_clients.erase(rit, g_clients.end());
             if (g_clients.size() != before) {
                 char lbuf[128];
                 snprintf(lbuf, sizeof(lbuf), "x4mp: net: pruned %zu dead client(s); %zu remain",
                          before - g_clients.size(), g_clients.size());
                 net_log(lbuf);
+            }
+        }
+        // DIAG: dump the fd table periodically so a silent fd death can be
+        // bracketed between two dumps.
+        if ((g_net_tick % 300) == 0) net_dump_fds("periodic");
+        // Consolidated TCP: fd-less entries are dead connections (the client
+        // reconnects via a fresh accept). Erase them so g_clients tracks real
+        // connections only (prevents unbounded growth + wasted iteration).
+        if (!g_legacy_net && g_transport == "tcp") {
+            for (auto it = g_clients.begin(); it != g_clients.end(); ) {
+                if (it->tcp_fd < 0) it = g_clients.erase(it);
+                else ++it;
             }
         }
         // Debug: enumerate ships/stations across all factions.
@@ -1412,12 +1953,8 @@ static void net_update() {
                 uint32_t nf = g_game->GetAllFactions(factions, 64, true);
                 uint32_t total_ships = 0, total_stations = 0;
                 for (uint32_t i = 0; i < nf; i++) {
-                    UniverseID ships[2048];
-                    total_ships += g_game->GetAllFactionShips(ships, 2048, factions[i]);
-                    if (g_game->GetAllFactionStations) {
-                        UniverseID stations[2048];
-                        total_stations += g_game->GetAllFactionStations(stations, 2048, factions[i]);
-                    }
+                    total_ships += g_game->GetNumAllFactionShips ? g_game->GetNumAllFactionShips(factions[i]) : 0;
+                    total_stations += g_game->GetNumAllFactionStations ? g_game->GetNumAllFactionStations(factions[i]) : 0;
                 }
                 char dbg[256];
                 snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST %u factions: %u ships, %u stations total",
@@ -1429,14 +1966,18 @@ static void net_update() {
         if ((g_net_tick % 300) == 0 && !g_clients.empty()) {
             char buf[128];
             snprintf(buf, sizeof(buf), "PING %u\n", g_net_tick);
-            net_send_host(buf);
+            net_send_ctrl_host(buf);
         }
         // Simulation maintenance (high-simulation set, per-sector activation,
         // sector macro map, stream cache): every ~5s while hosting, regardless
         // of whether the OBJ broadcast is enabled.
         if ((g_net_tick % 300) == 0) net_maintain_universe();
         // Maintain per-client TCP stream connections (connect / reconnect).
-        for (auto& c : g_clients) net_client_tcp(c);
+        // (Skipped for UDP — no TCP connection is used for the data stream; and
+        // skipped in consolidated TCP mode — the client connects to OUR listener.)
+        if (g_transport == "tcp" && g_legacy_net) {
+            for (auto& c : g_clients) net_client_tcp(c);
+        }
         // Rate-limit state streaming: only send SNAP/OBJ every g_update_interval
         // frames (default 15 Hz instead of every frame at 60fps). This cuts
         // bandwidth and CPU by ~4x with no perceptible loss for a thin client.
@@ -1464,6 +2005,12 @@ static void net_update() {
             }
         }
     } else if (g_net_client) {
+        // Consolidated TCP mode: if the connection dropped, reconnect (recreate
+        // the TCP socket + connect). The host re-accepts us as a fresh client.
+        if (!g_legacy_net && g_transport == "tcp" && g_sock < 0) {
+            net_init_client(g_net_host_ip.c_str(), g_net_port);
+            g_net_connected = false;
+        }
         // Detect a dead link / host restart: if we were connected but have not
         // received any data from the host for the timeout, drop back to the
         // unconnected state so we re-send JOIN and re-establish the handshake.
@@ -1477,32 +2024,32 @@ static void net_update() {
         }
         // Send a JOIN until we're connected (re-sent after a link drop).
         if (!g_net_connected) {
-            if ((g_net_tick % 60) == 0) net_send(&g_host_sa, "JOIN x4mp\n");
+            if ((g_net_tick % 60) == 0) net_send_client("JOIN x4mp\n");
         } else {
             // Tell the host our dedicated stream port once (x4mp_stream).
             if (!g_stream_reported) {
                 char sbuf[32];
                 snprintf(sbuf, sizeof(sbuf), "STREAM %d\n", g_stream_port);
-                net_send(&g_host_sa, sbuf);
+                net_send_client(sbuf);
                 g_stream_reported = true;
             }
             // While loading our save, tell the host so it won't prune us
             // (we can't send INPUT while the game is busy loading).
             if (g_save_loading && (g_net_tick % 60) == 0)
-                net_send(&g_host_sa, "LOADING\n");
+                net_send_client("LOADING\n");
             // Layer 2: send input/commands to the host (rate-limited to the
             // same update interval to reduce uplink traffic).
             if ((g_net_tick % g_update_interval) == 0) {
                 char buf[128];
                 snprintf(buf, sizeof(buf), "INPUT tick=%u\n", g_net_tick);
-                net_send(&g_host_sa, buf);
+                net_send_client(buf);
                 // Test action channel (X4MP_TEST_ACTION=1): send a periodic ACT
                 // to validate the client->host action transport (the follow-up
                 // player-action replication). The host logs every ACT it receives.
                 if (g_test_action && g_client_ready && (g_net_tick % 300) == 0) {
                     char abuf[64];
                     snprintf(abuf, sizeof(abuf), "ACT test n=%u\n", g_net_tick);
-                    net_send(&g_host_sa, abuf);
+                    net_send_client(abuf);
                 }
                 // Send our ship state so the host (and other clients via relay)
                 // can see us. Only once we are in the universe with a valid ship.
@@ -1524,11 +2071,68 @@ static void net_update() {
                         snprintf(pbuf, sizeof(pbuf), "PLAYER %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
                                  pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.roll,
                                  macro[0] ? macro : "?", csector[0] ? csector : "?");
-                        net_send(&g_host_sa, pbuf);
+                        net_send_client(pbuf);
                         if (g_debug) {
                             char dbg[340];
                             snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT sending PLAYER ship=%llu pos=(%.1f,%.1f,%.1f) macro=%s sector=%s",
                                      (unsigned long long)ship, pos.x, pos.y, pos.z, macro[0] ? macro : "?", csector[0] ? csector : "?");
+                            net_debug(dbg);
+                        }
+                    }
+                }
+                // Issue 4: retry the fleet reassignment until the player-ship
+                // APIs report the own ship (they are not ready at universe_ready
+                // time; reassigning before then would make the player ship
+                // alien-owned and unboardable).
+                if (!g_fleet_reassigned && g_net_tick % 100 == 0) {
+                    g_fleet_reassigned = client_reassign_player_fleet();
+                    if (!g_fleet_reassigned && g_debug) {
+                        UniverseID pobj = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
+                        const char* owner = "?";
+                        if (pobj && g_game->GetOwnerDetails2) {
+                            auto od = g_game->GetOwnerDetails2(pobj);
+                            if (od.factionID) owner = od.factionID;
+                        }
+                        char dbg[220];
+                        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT fleet-reassign retry (tick=%u): player_obj=%llu owner=%s — not identified yet",
+                                 g_net_tick, (unsigned long long)pobj, owner);
+                        net_debug(dbg);
+                    }
+                }
+                // Issue 3: report stations this client built after load so the
+                // host can spawn ghosts of them. Scanning every ~10 s is plenty
+                // (station builds are rare and slow); the seen-set is baselined
+                // at ready time with the save's own stations.
+                if (g_client_ready && g_game && g_game->GetAllFactionStations &&
+                    g_net_tick % 200 == 0) {
+                    std::vector<UniverseID> sts;
+                    uint32_t ns = enumerate_faction_stations("player", sts);
+                    // Re-send EVERY non-baseline station each cycle with a
+                    // stable seq: the host dedupes via its spawned[seq] table,
+                    // so this is idempotent and recovers from any deferred/
+                    // dropped ACT BUILD. Baseline stations (from the save) are
+                    // never reported — the host already has them.
+                    for (uint32_t i = 0; i < ns; i++) {
+                        UniverseID s = sts[i];
+                        if (!s || g_client_station_baseline.count(s)) continue;
+                        auto sit = g_client_station_seq_map.find(s);
+                        bool first = (sit == g_client_station_seq_map.end());
+                        uint32_t seq = first ? g_client_station_seq++ : sit->second;
+                        if (first) g_client_station_seq_map[s] = seq;
+                        char macro[160], csector[160] = {0};
+                        get_macro(s, macro, sizeof(macro));
+                        UIPosRot pos = g_game->GetObjectPositionInSector(s);
+                        UniverseID sec = g_game->GetContextByClass ? g_game->GetContextByClass(s, "sector", false) : 0;
+                        if (sec) get_macro(sec, csector, sizeof(csector));
+                        char b[420];
+                        snprintf(b, sizeof(b), "ACT BUILD %u %s %.3f %.3f %.3f %.3f %.3f %.3f %s\n",
+                                 seq, macro[0] ? macro : "?", pos.x, pos.y, pos.z,
+                                 pos.yaw, pos.pitch, pos.roll, csector[0] ? csector : "?");
+                        net_send_client(b);
+                        if (first) {
+                            char dbg[300];
+                            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT reporting new station seq=%u id=%llu macro=%s sector=%s",
+                                     seq, (unsigned long long)s, macro, csector[0] ? csector : "?");
                             net_debug(dbg);
                         }
                     }
@@ -1548,6 +2152,15 @@ static void read_config() {
     if (auto_mode) g_auto = auto_mode;
     const char* ta = std::getenv("X4MP_TEST_ACTION");
     if (ta && *ta == '1') g_test_action = true;
+    const char* tm = std::getenv("X4MP_TEST_MENU");
+    if (tm && *tm) {
+        g_test_menu = true;
+        g_test_menu_role = tm;
+        g_test_menu_time = std::chrono::steady_clock::now();
+    }
+    const char* pf = std::getenv("X4MP_PERF_LOG");
+    if (pf && *pf) g_perf_log_path = pf;
+    g_perf_log_time = std::chrono::steady_clock::now();
     const char* ip = std::getenv("X4MP_SERVER_IP");
     if (ip) g_server_ip = ip;
     const char* mod = std::getenv("X4MP_MODULE");
@@ -1561,6 +2174,14 @@ static void read_config() {
     if (ip) g_net_host_ip = ip;
     const char* sp = std::getenv("X4MP_STREAM_PORT");
     if (sp) { int v = atoi(sp); if (v > 0 && v < 65535) g_stream_port = v; }
+    const char* tr = std::getenv("X4MP_TRANSPORT");
+    if (tr && *tr) {
+        std::string t = tr;
+        if (t == "udp" || t == "UDP") g_transport = "udp";
+        else g_transport = "tcp";
+    }
+    const char* ln = std::getenv("X4MP_LEGACY_NET");
+    if (ln) g_legacy_net = (*ln != '0');   // default OFF (consolidated); X4MP_LEGACY_NET=1 restores the legacy split-port mode
     const char* rel = std::getenv("X4MP_RELEVANCE_M");
     if (rel) { float v = (float)atof(rel); if (v >= 1000.0f && v <= 1000000.0f) g_relevance_m = v; }
     const char* dbg = std::getenv("X4MP_DEBUG");
@@ -1639,6 +2260,27 @@ static void start_streams() {
 static void net_start() {
     if (g_auto == "host" && !g_net_host) {
         net_init_host(g_net_port);
+        // Consolidated UDP mode: the data rides the control socket (g_sock, 7777),
+        // so no separate data socket is needed. Legacy UDP mode: create one (7778).
+        if (g_transport == "udp" && g_stream_udp_sock < 0 && g_legacy_net) {
+            g_stream_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (g_stream_udp_sock >= 0) {
+                int fl = fcntl(g_stream_udp_sock, F_GETFL, 0);
+                fcntl(g_stream_udp_sock, F_SETFL, fl | O_NONBLOCK);
+                char m[160];
+                snprintf(m, sizeof(m), "x4mp: net: HOST data stream using UDP (sendto clients' port %d)", g_stream_port);
+                net_log(m);
+            } else {
+                char m[128];
+                snprintf(m, sizeof(m), "x4mp: net: WARNING — could not create UDP data socket; falling back to TCP");
+                net_log(m);
+                g_transport = "tcp";
+            }
+        } else if (g_transport == "tcp") {
+            char m[160];
+            snprintf(m, sizeof(m), "x4mp: net: HOST data stream using TCP");
+            net_log(m);
+        }
     } else if (g_auto == "client" && !g_net_client) {
         net_init_client(g_net_host_ip.c_str(), g_net_port);
     }
@@ -1691,19 +2333,52 @@ static void do_join(const char* server_ip) {
 
 // ---- Event callbacks ------------------------------------------------------
 
+// In-game menu "Host Multiplayer" (from the main menu). This drives OUR
+// custom networking (not X4's built-in EgoNet multiplayer). We set the role
+// at runtime, start our custom transport now, and load the designated save
+// (X4MP_SAVE) if one was prepared by the launcher. The existing frame-update
+// / on_game_loaded logic then finishes the job (load save -> do_host ->
+// start_streams).
 static void on_host_request(const char* /*event_name*/, void* data, void* /*userdata*/) {
     const char* module = (data && *(const char*)data) ? (const char*)data : nullptr;
-    g_api->log(X4NATIVE_LOG_INFO, "x4mp: host requested — will host on next frame update");
-    // Defer to the frame update. Calling NewMultiplayerGame synchronously
-    // from the Lua menu handler crashes the game. The frame update runs
-    // outside the Lua call stack, in the game's native loop.
-    g_host_pending = true;
+    g_api->log(X4NATIVE_LOG_INFO, "x4mp: HOST requested (in-game menu)");
+    g_auto = "host";                       // set role at runtime (menu-driven)
     if (module && *module) g_module = module;
+    net_start();                           // start our custom network (UDP 7777) now
+    if (!g_save.empty()) {
+        g_save_pending = true;             // load the save first; do_host on game loaded
+        char buf[256];
+        snprintf(buf, sizeof(buf), "x4mp: menu host — will load save '%s' then start streaming",
+                 g_save.c_str());
+        g_api->log(X4NATIVE_LOG_INFO, buf);
+    } else {
+        g_host_pending = true;             // no save: host a new game on next frame
+        g_api->log(X4NATIVE_LOG_INFO, "x4mp: menu host — no save, hosting a new game");
+    }
 }
 
+// In-game menu "Join Multiplayer" (from the main menu, arg = host IP). Sets the
+// role at runtime, connects our custom transport to the host, and loads the
+// designated save (X4MP_SAVE). The existing client logic (load save -> universe
+// ready -> client_mark_ready -> start_streams) finishes the job. We do NOT call
+// do_join() (ConnectToMultiplayerGame) — our custom net (net_start) is what
+// actually connects.
 static void on_join_request(const char* /*event_name*/, void* data, void* /*userdata*/) {
     const char* ip = (data && *(const char*)data) ? (const char*)data : nullptr;
-    do_join(ip);
+    g_api->log(X4NATIVE_LOG_INFO, "x4mp: JOIN requested (in-game menu)");
+    g_auto = "client";                     // set role at runtime (menu-driven)
+    if (ip && *ip) { g_server_ip = ip; g_net_host_ip = ip; }
+    net_start();                           // connect our custom network (UDP 7777) now
+    if (!g_save.empty()) {
+        g_save_pending = true;             // load the same save; client logic connects
+        char buf[256];
+        snprintf(buf, sizeof(buf), "x4mp: menu join — will load save '%s' then connect to %s",
+                 g_save.c_str(), g_net_host_ip.c_str());
+        g_api->log(X4NATIVE_LOG_INFO, buf);
+    } else {
+        g_newgame_pending = true;          // no save: thin client, new game
+        g_api->log(X4NATIVE_LOG_INFO, "x4mp: menu join — no save, thin client new game");
+    }
 }
 
 // Forward decl: client_mark_ready() is defined below (after on_frame_update).
@@ -1711,8 +2386,54 @@ static void client_mark_ready(const char* source);
 
 static void on_frame_update(const char* /*event_name*/, void* data, void* /*userdata*/) {
     (void)data;
-    // Drive our custom network every frame.
-    net_update();
+    // Drive our custom network every frame (measured for PERF logging).
+    {
+        auto tu0 = std::chrono::steady_clock::now();
+        net_update();
+        auto tu1 = std::chrono::steady_clock::now();
+        g_perf_net_us += std::chrono::duration_cast<std::chrono::microseconds>(tu1 - tu0).count();
+        g_perf_net_count++;
+    }
+    // PERF: log FPS + per-tick net_update cost every 2s to a file.
+    g_perf_frames++;
+    {
+        auto now = std::chrono::steady_clock::now();
+        long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_perf_log_time).count();
+        if (elapsed_ms >= 2000 && g_perf_frames > 0) {
+            double fps = g_perf_frames * 1000.0 / (double)elapsed_ms;
+            long long avg_net_us = g_perf_net_count ? (g_perf_net_us / g_perf_net_count) : 0;
+            g_perf_frames = 0; g_perf_net_us = 0; g_perf_net_count = 0;
+            g_perf_log_time = now;
+            FILE* pf = fopen(g_perf_log_path.c_str(), "a");
+            if (pf) {
+                char pline[256];
+                snprintf(pline, sizeof(pline),
+                         "role=%s fps=%.1f net_update_avg_us=%lld clients=%zu\n",
+                         g_auto.c_str(), fps, avg_net_us, g_clients.size());
+                fputs(pline, pf);
+                fclose(pf);
+            }
+        }
+    }
+    // Test hook: simulate the in-game menu click after a delay (so the
+    // menu-driven host/join flow can be verified without clicking).
+    if (g_test_menu && !g_test_menu_done) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - g_test_menu_time).count();
+        if (elapsed >= 25000) {
+            g_test_menu_done = true;
+            char lbuf[160];
+            snprintf(lbuf, sizeof(lbuf), "x4mp: TEST MENU — simulating '%s' click (menu-driven flow)",
+                     g_test_menu_role.c_str());
+            g_api->log(X4NATIVE_LOG_INFO, lbuf);
+            if (g_test_menu_role == "host") {
+                on_host_request(nullptr, nullptr, nullptr);
+            } else {
+                const char* ip = g_server_ip.c_str();
+                on_join_request(nullptr, (void*)ip, nullptr);
+            }
+        }
+    }
     // THIN CLIENT: render the host's streamed state. When paused (thin client),
     // move the player to the host's position. When NOT paused, the user flies
     // the client's ship, so we don't override their position.
@@ -1847,6 +2568,85 @@ static void on_game_loaded(const char* /*event_name*/, void* /*data*/, void* /*u
     if (g_auto == "host" && !g_host_done && g_save.empty()) do_host(nullptr, nullptr);
 }
 
+// CLIENT (issue 4): in a shared save, the player faction ("player") owns the
+// HOST player's fleet. Loaded locally, those ships render on the client as the
+// client's OWN ships — the client "sees the host's ships as its own". Reassign
+// every player-faction ship (except the ship the client itself pilots) to the
+// host-display faction so the host's fleet renders as a foreign faction.
+// The client's own piloted ship keeps the vanilla player faction so the client
+// player recognises it (and can still board it — an alien-owned ship is
+// unboardable).
+//
+// Returns true once done. Returns false if the player-ship APIs are not ready
+// yet (all sources return 0 right after universe_ready — retrying is required,
+// otherwise the player's OWN ship would be reassigned and become unboardable).
+static bool client_reassign_player_fleet() {
+    if (!g_game || !g_game->GetAllFactions || !g_game->GetAllFactionShips ||
+        !g_game->SetComponentOwner) return false;
+    ensure_real_factions();
+    if (g_real_factions.empty()) return false; // nothing safe to reassign to
+    // Identify the client's own player ship(s) to exclude (multi-source: a
+    // docked player returns 0 from GetPlayerControlledShipID).
+    UniverseID keep[5] = {0,0,0,0,0};
+    keep[0] = g_game->GetPlayerControlledShipID ? g_game->GetPlayerControlledShipID() : 0;
+    keep[1] = g_game->GetPlayerShipID ? g_game->GetPlayerShipID() : 0;
+    keep[2] = g_game->GetPlayerOccupiedShipID ? g_game->GetPlayerOccupiedShipID() : 0;
+    keep[3] = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
+    keep[4] = (keep[3] && g_game->GetContextByClass) ? g_game->GetContextByClass(keep[3], "ship", false) : 0;
+    // Campaign saves: the player pilots a FOREIGN-faction ship (e.g. the
+    // Boron1 "alliance" ship). Then every PF ship is the player's OWN ship —
+    // there is nothing of the host's to hide, so we are done (do not retry).
+    if (keep[3] && g_game->GetOwnerDetails2) {
+        auto od = g_game->GetOwnerDetails2(keep[3]);
+        if (od.factionID && strcmp(od.factionID, "player") != 0) {
+            if (g_debug) {
+                char dbg[200];
+                snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT fleet reassign skipped: player pilots foreign faction '%s' (PF ships are the player's own)", od.factionID);
+                net_debug(dbg);
+            }
+            return true;
+        }
+    }
+    // Only reassign ships owned by the vanilla player faction.
+    std::vector<UniverseID> pfships;
+    uint32_t n = enumerate_faction_ships("player", pfships);
+    // Safety: only proceed once the player's OWN ship is positively identified
+    // as a member of the player-faction ship set. An ambiguous non-zero
+    // GetPlayerObjectID (e.g. a station) must never be taken as "identified",
+    // or the player's real ship would get reassigned and become unboardable.
+    // Identify which of the keep IDs is actually a player-faction ship.
+    // IMPORTANT: this must stay strict. In a campaign save the piloted ship is
+    // a FOREIGN faction (e.g. "alliance") and none of the keep IDs is in the
+    // PF set — then we must NOT reassign anything: the PF ships there are the
+    // player's OWN ships (e.g. their docked scout), not the host's fleet.
+    bool identified = false;
+    for (int i = 0; i < 5; i++) {
+        if (!keep[i]) continue;
+        for (uint32_t j = 0; j < n; j++) if (pfships[j] == keep[i]) { identified = true; break; }
+        if (identified) break;
+    }
+    if (!identified) return false; // nothing safe to exclude — retry/never
+    const char* fhost = g_real_factions[0].c_str();
+    auto is_keep = [&](UniverseID s) {
+        for (int i = 0; i < 5; i++) if (keep[i] && keep[i] == s) return true;
+        return false;
+    };
+    uint32_t reassigned = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        UniverseID s = pfships[i];
+        if (!s || is_keep(s)) continue;
+        g_game->SetComponentOwner(s, fhost);
+        reassigned++;
+    }
+    char dbg[260];
+    snprintf(dbg, sizeof(dbg), "x4mp: [DBG] CLIENT reassigned %u/%u player-faction ships -> %s (keep=[%llu %llu %llu %llu %llu])",
+             reassigned, n, fhost,
+             (unsigned long long)keep[0], (unsigned long long)keep[1], (unsigned long long)keep[2],
+             (unsigned long long)keep[3], (unsigned long long)keep[4]);
+    net_debug(dbg);
+    return true;
+}
+
 // Mark the thin client ready to render host-streamed objects. This is the ONLY
 // place g_client_ready is set, so object spawning never starts before the game
 // is in a usable state.
@@ -1863,8 +2663,21 @@ static void client_mark_ready(const char* source) {
     char lbuf[192];
     snprintf(lbuf, sizeof(lbuf), "x4mp: client in universe — ready to render host state (via %s)", source);
     g_api->log(X4NATIVE_LOG_INFO, lbuf);
+    // Reassign the host's player-faction fleet so it renders as foreign, not
+    // as the client's own ships (issue 4). The player-ship APIs may not be
+    // ready this early — on failure, retry every ~5 s from net_update.
+    g_fleet_reassigned = client_reassign_player_fleet();
+    // Baseline the save's player-faction stations (issue 3): they already
+    // exist on the host (same save) and must never be reported (duplicates).
+    // Only stations built AFTER load are new client builds to replicate.
+    g_client_station_baseline.clear();
+    if (g_game && g_game->GetAllFactionStations) {
+        std::vector<UniverseID> sts;
+        uint32_t ns = enumerate_faction_stations("player", sts);
+        for (uint32_t i = 0; i < ns; i++) if (sts[i]) g_client_station_baseline.insert(sts[i]);
+    }
     // Tell the host we finished loading so it resumes normal liveness pruning.
-    net_send(&g_host_sa, "READY\n");
+    net_send_client("READY\n");
     // Start the data-receive threads only after we are ready to render.
     start_streams();
     // OPTION 2: after a short delay remove the client's own save objects so
@@ -1972,5 +2785,16 @@ X4NATIVE_EXPORT void x4native_shutdown(void) {
     if (g_sub_host)   g_api->unsubscribe(g_sub_host);
     if (g_sub_join)   g_api->unsubscribe(g_sub_join);
     if (g_sub_universe) g_api->unsubscribe(g_sub_universe);
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+    if (g_sock >= 0) { net_close_fd(g_sock, "shutdown_g_sock"); g_sock = -1; }
+    // Release the consolidated-mode TCP listener + any per-client connections.
+    // The game re-initializes the extension on its 2-pass save load; if we don't
+    // close these here, the first pass's listener keeps port 7778 bound and the
+    // second pass's bind() fails (g_listen_sock = -1 -> host never accepts).
+    if (g_listen_sock >= 0) { net_close_fd(g_listen_sock, "shutdown_listen"); g_listen_sock = -1; }
+    for (auto& c : g_clients) if (c.tcp_fd >= 0) { net_close_fd(c.tcp_fd, "shutdown_client"); c.tcp_fd = -1; }
+    g_clients.clear();
+    g_client_tcp_buf.clear();
+    g_net_host = false;
+    g_net_client = false;
+    g_net_connected = false;
 }

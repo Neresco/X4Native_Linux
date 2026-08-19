@@ -48,6 +48,8 @@ static volatile bool g_ready = false;   // set true on on_universe_ready
 
 // ---- Config (env overrides) ----------------------------------------------
 static int   g_stream_port   = 7778;   // X4MP_STREAM_PORT
+static std::string g_transport = "tcp"; // X4MP_TRANSPORT: tcp (default) or udp
+static bool  g_legacy_net    = false;  // X4MP_LEGACY_NET: 1=own socket/recv (legacy), 0=x4mp owns the connection (DEFAULT)
 static int   g_render_interval = 3;    // frames between render passes (20Hz @60fps)
 static float g_smooth_tau    = 0.12f;  // interpolation time constant (seconds)
 
@@ -155,6 +157,28 @@ static void get_macro(UniverseID id, char* out, size_t outsize) {
 // macro-name -> sector-id map so host-streamed objects can be placed in the
 // correct client sector.
 //
+// Enumerate ALL ships/stations of a faction with no arbitrary buffer cap.
+// A fixed 2048-entry stack buffer silently dropped the overflow for large
+// factions, so the local index / sector map were incomplete and ships beyond
+// the cap were never bound (and got pruned as "missing"). Sizing from
+// GetNumAllFactionShips/Stations and heap-allocating removes the cap.
+static uint32_t enum_faction_ships(const char* faction, std::vector<UniverseID>& out) {
+    if (!g_game || !g_game->GetAllFactionShips) return 0;
+    uint32_t cap = 4096;
+    if (g_game->GetNumAllFactionShips) cap = std::max<uint32_t>(cap, g_game->GetNumAllFactionShips(faction));
+    if (cap == 0) return 0;
+    out.resize(cap);
+    return g_game->GetAllFactionShips(out.data(), cap, faction);
+}
+static uint32_t enum_faction_stations(const char* faction, std::vector<UniverseID>& out) {
+    if (!g_game || !g_game->GetAllFactionStations) return 0;
+    uint32_t cap = 1024;
+    if (g_game->GetNumAllFactionStations) cap = std::max<uint32_t>(cap, g_game->GetNumAllFactionStations(faction));
+    if (cap == 0) return 0;
+    out.resize(cap);
+    return g_game->GetAllFactionStations(out.data(), cap, faction);
+}
+
 // GetSectorsByOwner is unreliable on a paused thin client (ownership data is
 // not computed). Instead we derive the sector set from the client's own loaded
 // objects (ships + stations) via GetContextByClass, which works regardless of
@@ -172,14 +196,13 @@ static void build_sector_map() {
         if (m[0]) g_sector_map[m] = sid;
     };
     uint32_t iterated = 0, found = 0;
+    std::vector<UniverseID> objs;
     for (uint32_t f = 0; f < nf; f++) {
-        UniverseID ships[2048];
-        uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
-        for (uint32_t i = 0; i < ns; i++) { iterated++; add_sector(ships[i]); }
+        uint32_t ns = enum_faction_ships(factions[f], objs);
+        for (uint32_t i = 0; i < ns; i++) { iterated++; add_sector(objs[i]); }
         if (g_game->GetAllFactionStations) {
-            UniverseID stations[2048];
-            uint32_t nst = g_game->GetAllFactionStations(stations, 2048, factions[f]);
-            for (uint32_t i = 0; i < nst; i++) { iterated++; add_sector(stations[i]); }
+            uint32_t nst = enum_faction_stations(factions[f], objs);
+            for (uint32_t i = 0; i < nst; i++) { iterated++; add_sector(objs[i]); }
         }
     }
     if (g_api) {
@@ -197,6 +220,29 @@ static void build_sector_map() {
     }
 }
 
+// All known IDs of the player's own ship(s) in ANY state (flying, docked,
+// in a hangar). Binding, convergence and pruning must NEVER touch these:
+// removing the player ship triggers "Game Over (killmethod=removed)" and the
+// game aborts to the main menu (the client save-reload loop).
+struct PlayerShipIDs {
+    UniverseID ids[5] = {0, 0, 0, 0, 0};
+    PlayerShipIDs() {
+        if (!g_game) return;
+        ids[0] = g_game->GetPlayerControlledShipID ? g_game->GetPlayerControlledShipID() : 0;
+        ids[1] = g_game->GetPlayerShipID ? g_game->GetPlayerShipID() : 0;
+        ids[2] = g_game->GetPlayerOccupiedShipID ? g_game->GetPlayerOccupiedShipID() : 0;
+        UniverseID po = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
+        ids[3] = po;
+        ids[4] = (po && g_game->GetContextByClass)
+                     ? g_game->GetContextByClass(po, "ship", false) : 0;
+    }
+    bool contains(UniverseID s) const {
+        for (int i = 0; i < 5; i++)
+            if (ids[i] && ids[i] == s) return true;
+        return false;
+    }
+};
+
 // Enumerate the client's local ships in ONE sector and build the binding
 // index (macro -> local ship ids). Called on the main thread when the client
 // enters a new sector. The enumeration is C-level (GetContextByClass) for all
@@ -211,23 +257,27 @@ static void rebuild_local_index(UniverseID sector) {
     g_index_sector = sector;
     if (!g_game || !g_game->GetAllFactions || !g_game->GetAllFactionShips ||
         !g_game->GetContextByClass) return;
-    // Never bind/correct/remove the player's own ship(s).
-    UniverseID player_ship = g_game->GetPlayerControlledShipID ? g_game->GetPlayerControlledShipID() : 0;
-    UniverseID player_obj = g_game->GetPlayerObjectID ? g_game->GetPlayerObjectID() : 0;
-    UniverseID player_ship2 = (player_obj && g_game->GetContextByClass)
-                                  ? g_game->GetContextByClass(player_obj, "ship", false) : 0;
+    // Never bind/correct/remove the player's own ship(s) — in every state
+    // (a DOCKED player returns 0 from GetPlayerControlledShipID, so the old
+    // two-ID exclusion failed and pruning deleted the docked player ship).
+    PlayerShipIDs pids;
     const char* factions[64];
     uint32_t nf = g_game->GetAllFactions(factions, 64, true);
+    std::vector<UniverseID> ships;
+    // Dedupe: the same ship can be returned by multiple factions' enumerations
+    // (includehidden aliases), which would fill the index with duplicates.
+    std::unordered_set<UniverseID> indexed;
+    uint32_t dupes = 0;
     for (uint32_t f = 0; f < nf; f++) {
-        UniverseID ships[2048];
-        uint32_t ns = g_game->GetAllFactionShips(ships, 2048, factions[f]);
+        uint32_t ns = enum_faction_ships(factions[f], ships);
         for (uint32_t i = 0; i < ns; i++) {
             UniverseID s = ships[i];
-            if (s == player_ship || s == player_ship2) continue;
+            if (pids.contains(s)) continue;
             if (g_game->IsValidComponent && !g_game->IsValidComponent(s)) continue;
             if (g_game->GetContextByClass(s, "sector", false) != sector) continue;
             char macro[160]; get_macro(s, macro, sizeof(macro));
             if (!macro[0] || macro[0] == '?') continue;
+            if (!indexed.insert(s).second) { dupes++; continue; }
             size_t idx = g_index_ships.size();
             g_index_ships.push_back(s);
             g_index_by_macro[std::string(macro)].push_back(idx);
@@ -245,8 +295,8 @@ static void rebuild_local_index(UniverseID sector) {
     }
     if (g_api && g_api->log) {
         char m[256];
-        snprintf(m, sizeof(m), "x4mp_stream: local index rebuilt for sector %llu: %zu ships (inert=%d)",
-                 (unsigned long long)sector, g_index_ships.size(), (int)g_inert);
+        snprintf(m, sizeof(m), "x4mp_stream: local index rebuilt for sector %llu: %zu ships, %u dupes dropped (inert=%d)",
+                 (unsigned long long)sector, g_index_ships.size(), dupes, (int)g_inert);
         g_api->log(X4NATIVE_LOG_INFO, m);
     }
 }
@@ -321,6 +371,23 @@ static void parse_line(char* line) {
     }
 }
 
+// Event bridge (consolidated one-port-per-transport design): x4mp owns the
+// network connection and raises "x4mp_stream.data" with each OBJ/PLAYER line it
+// receives from the host. This feeds the line into the SAME parse_line() the old
+// dedicated recv thread used, so reconciliation (render_pass) is unchanged.
+// Synchronous: the line is valid for the duration of the raise (it lives on
+// x4mp's recv stack). Only used when X4MP_LEGACY_NET=0 (legacy keeps recv_loop).
+static void on_stream_data(const char* /*event_name*/, void* data, void* /*userdata*/) {
+    if (data) {
+        // Consolidated mode: data arrives via the event bridge, not recv_loop,
+        // so refresh the link-alive timestamp here (legacy recv_loop does it
+        // itself). Without this, link_alive would stay false forever and the
+        // missing-ship prune (and its safety gate) would never run.
+        g_last_recv_any = std::chrono::steady_clock::now();
+        parse_line((char*)data);
+    }
+}
+
 // Receive thread: accept the host's TCP connection and read the reliable byte
 // stream, splitting it into newline-delimited lines. TCP may deliver a line
 // split across reads or several lines in one read, so we accumulate in a
@@ -330,6 +397,31 @@ static void recv_loop() {
     std::string acc;   // accumulates partial lines across reads
     char buf[65536];
     while (g_running) {
+        // UDP: no connection — recvfrom the bound socket directly (datagrams
+        // can be dropped/reordered; the host resends the full state each tick).
+        if (g_transport == "udp") {
+            struct pollfd pfd; pfd.fd = g_listen_sock; pfd.events = POLLIN; pfd.revents = 0;
+            int pr = poll(&pfd, 1, 100);
+            if (pr < 0) { if (errno == EINTR) continue; continue; }
+            if (pr == 0) continue;
+            struct sockaddr_in from; socklen_t fl = sizeof(from);
+            ssize_t n = recvfrom(g_listen_sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fl);
+            if (n <= 0) { if (errno == EINTR) continue; continue; }
+            acc.append(buf, (size_t)n);
+            g_last_recv_any = std::chrono::steady_clock::now();
+            size_t start = 0;
+            for (;;) {
+                size_t nl = acc.find('\n', start);
+                if (nl == std::string::npos) break;
+                acc[nl] = 0;
+                if (nl > start) parse_line(acc.data() + start);
+                start = nl + 1;
+            }
+            if (start > 0) acc.erase(0, start);
+            if (acc.size() > 2000000) acc.clear();
+            continue;
+        }
+        // TCP: (re)accept the host's connection, then recv.
         if (g_data_sock < 0) {
             // (Re)accept the host's TCP connection.
             if (g_listen_sock < 0) { usleep(2000); continue; }
@@ -498,6 +590,15 @@ static void render_pass() {
         // client flies into that sector.
         if (target_sector != client_sector) {
             if (!o.is_player) {
+                // Release any binding first: dropping the RemoteObj without
+                // clearing g_bindings/g_bound_locals leaks the local ship into
+                // g_bound_locals forever, where the prune loop skips it — the
+                // ship then stays frozen in place indefinitely.
+                auto bit = g_bindings.find(kv.first);
+                if (bit != g_bindings.end()) {
+                    g_bound_locals.erase(bit->second);
+                    g_bindings.erase(bit);
+                }
                 // Remove a spawned ghost ship so it does not linger as an
                 // orphan in the old sector (each ship ~30 IDs in the game's
                 // ID map; orphans from many sector crossings would refill it).
@@ -623,14 +724,30 @@ static void render_pass() {
     // Only after a FULL snapshot of this sector was received and the link is
     // alive, so a broken/slow stream can never wipe the local universe.
     if (g_full_received && link_alive && g_game->RemoveComponent && g_game->IsValidComponent) {
+        // Belt-and-suspenders: re-check the live player-ship IDs every pass so
+        // a docking/undocking state change can never expose the player ship to
+        // pruning (removing it = Game Over = the client save-reload loop).
+        PlayerShipIDs pids;
+        // Spawned ghosts (host ships with no local counterpart) must never be
+        // pruned even though they are unbound: after a sector entry they get
+        // indexed like any local ship, and the prune would kill + respawn them
+        // every ~10 s (ghost flicker) while the host keeps reporting them.
+        std::unordered_set<UniverseID> ghosts;
+        for (auto& kv : g_objs)
+            if (kv.second.spawned && kv.second.client_id) ghosts.insert(kv.second.client_id);
+        unsigned sk_pid = 0, sk_bound = 0, sk_ghost = 0, sk_invalid = 0, sk_young = 0;
         for (size_t idx = 0; idx < g_index_ships.size(); idx++) {
             UniverseID s = g_index_ships[idx];
-            if (g_bound_locals.count(s)) continue;
-            if (!g_game->IsValidComponent(s)) continue; // already gone
+            if (pids.contains(s)) { sk_pid++; continue; }
+            if (g_bound_locals.count(s)) { sk_bound++; continue; }
+            if (ghosts.count(s)) { sk_ghost++; continue; }
+            if (!g_game->IsValidComponent(s)) { sk_invalid++; continue; } // already gone
             auto ms = g_missing_since.find(s);
             if (ms == g_missing_since.end()) {
                 g_missing_since[s] = now;
-            } else if ((now - ms->second) > std::chrono::milliseconds(g_missing_prune_ms)) {
+            } else if ((now - ms->second) <= std::chrono::milliseconds(g_missing_prune_ms)) {
+                sk_young++;
+            } else {
                 g_game->RemoveComponent(s);
                 g_missing_since.erase(ms);
                 pruned++;
@@ -641,6 +758,13 @@ static void render_pass() {
                     net_log(dbg);
                 }
             }
+        }
+        if (g_debug && (dbg_tick % 300) == 0 && (sk_invalid || sk_young || sk_pid || sk_bound || sk_ghost)) {
+            char dbg[220];
+            snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] prune-skip: index=%zu pid=%u bound=%u ghost=%u invalid=%u young=%u (bound_locals=%zu bindings=%zu)",
+                     g_index_ships.size(), sk_pid, sk_bound, sk_ghost, sk_invalid, sk_young,
+                     g_bound_locals.size(), g_bindings.size());
+            net_log(dbg);
         }
     }
     if (g_debug && (dbg_tick % 300) == 0 && (bound_now || corrected || pruned)) {
@@ -735,6 +859,7 @@ static void on_universe_ready(const char* /*name*/, void* /*data*/, void* /*ud*/
 // ---- Init / shutdown -------------------------------------------------------
 static int g_sub_tick = -1;
 static int g_sub_universe = -1;
+static int g_sub_data = -1;
 
 X4NATIVE_EXPORT int x4native_api_version(void) { return 1; }
 
@@ -744,6 +869,14 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
 
     const char* sp = std::getenv("X4MP_STREAM_PORT");
     if (sp) { int v = atoi(sp); if (v > 0 && v < 65535) g_stream_port = v; }
+    const char* tr = std::getenv("X4MP_TRANSPORT");
+    if (tr && *tr) {
+        std::string t = tr;
+        if (t == "udp" || t == "UDP") g_transport = "udp";
+        else g_transport = "tcp";
+    }
+    const char* ln = std::getenv("X4MP_LEGACY_NET");
+    if (ln) g_legacy_net = (*ln != '0');   // default OFF (consolidated); X4MP_LEGACY_NET=1 -> legacy own-socket mode
     const char* ri = std::getenv("X4MP_RENDER_INTERVAL");
     if (ri) { int v = atoi(ri); if (v >= 1 && v <= 60) g_render_interval = v; }
     const char* tau = std::getenv("X4MP_SMOOTH_TAU");
@@ -765,37 +898,50 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     const char* afi = std::getenv("X4MP_AUTOFLY_INTERVAL");
     if (afi) { int v = atoi(afi); if (v >= 2 && v <= 300) g_autofly_interval_s = v; }
 
-    // Open the TCP stream listener. The host connects to this port and streams
-    // OBJ/PLAYER lines as a reliable byte stream (ordered, lossless).
-    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_listen_sock < 0) { net_log("x4mp_stream: failed to create socket"); return X4NATIVE_OK; }
-    int one = 1;
-    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    sa.sin_port = htons((uint16_t)g_stream_port);
-    if (bind(g_listen_sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        char m[128]; snprintf(m, sizeof(m), "x4mp_stream: bind port %d failed", g_stream_port);
-        net_log(m);
-        close(g_listen_sock); g_listen_sock = -1;
-        return X4NATIVE_OK;
+    // Legacy mode (X4MP_LEGACY_NET=1, default): open the data-stream listener
+    // (TCP or UDP) on g_stream_port; the host streams OBJ/PLAYER lines here and
+    // recv_loop() parses them. In the consolidated mode (X4MP_LEGACY_NET=0),
+    // x4mp owns the connection and feeds us lines via the "x4mp_stream.data"
+    // event, so we skip the socket/recv entirely.
+    if (g_legacy_net) {
+        int sock_type = (g_transport == "udp") ? SOCK_DGRAM : SOCK_STREAM;
+        g_listen_sock = socket(AF_INET, sock_type, 0);
+        if (g_listen_sock < 0) { net_log("x4mp_stream: failed to create socket"); return X4NATIVE_OK; }
+        int one = 1;
+        setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        sa.sin_port = htons((uint16_t)g_stream_port);
+        if (bind(g_listen_sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            char m[128]; snprintf(m, sizeof(m), "x4mp_stream: bind port %d failed", g_stream_port);
+            net_log(m);
+            close(g_listen_sock); g_listen_sock = -1;
+            return X4NATIVE_OK;
+        }
+        if (g_transport == "tcp" && listen(g_listen_sock, 4) < 0) {
+            net_log("x4mp_stream: listen failed");
+            close(g_listen_sock); g_listen_sock = -1;
+            return X4NATIVE_OK;
+        }
+        g_running = true;
+        g_recv_thread = std::thread(recv_loop);
+    } else {
+        net_log("x4mp_stream: consolidated mode — x4mp owns the connection (event-fed)");
     }
-    if (listen(g_listen_sock, 4) < 0) {
-        net_log("x4mp_stream: listen failed");
-        close(g_listen_sock); g_listen_sock = -1;
-        return X4NATIVE_OK;
-    }
-
-    g_running = true;
-    g_recv_thread = std::thread(recv_loop);
 
     g_sub_tick = api->subscribe("on_frame_update", on_frame_update, nullptr, api);
     g_sub_universe = api->subscribe("on_universe_ready", on_universe_ready, nullptr, api);
+    g_sub_data = api->subscribe("x4mp_stream.data", on_stream_data, nullptr, api);
 
-    char m[160];
-    snprintf(m, sizeof(m), "x4mp_stream: listening on TCP %d; render interval %d frames; INERT=%d",
-             g_stream_port, g_render_interval, (int)g_inert);
+    char m[200];
+    if (g_legacy_net) {
+        snprintf(m, sizeof(m), "x4mp_stream: listening on %s %d; render interval %d frames; INERT=%d",
+                 g_transport.c_str(), g_stream_port, g_render_interval, (int)g_inert);
+    } else {
+        snprintf(m, sizeof(m), "x4mp_stream: consolidated (event-fed); render interval %d frames; INERT=%d",
+                 g_render_interval, (int)g_inert);
+    }
     net_log(m);
     return X4NATIVE_OK;
 }
@@ -807,5 +953,6 @@ X4NATIVE_EXPORT void x4native_shutdown(void) {
     if (g_recv_thread.joinable()) g_recv_thread.join();
     if (g_api && g_api->unsubscribe && g_sub_tick >= 0) g_api->unsubscribe(g_sub_tick);
     if (g_api && g_api->unsubscribe && g_sub_universe >= 0) g_api->unsubscribe(g_sub_universe);
+    if (g_api && g_api->unsubscribe && g_sub_data >= 0) g_api->unsubscribe(g_sub_data);
     net_log("x4mp_stream: shutting down");
 }

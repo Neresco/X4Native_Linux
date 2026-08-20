@@ -24,6 +24,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
 #include <string>
 #include <chrono>
 
@@ -51,6 +52,8 @@ static int   g_stream_port   = 7778;   // X4MP_STREAM_PORT
 static std::string g_transport = "tcp"; // X4MP_TRANSPORT: tcp (default) or udp
 static bool  g_legacy_net    = false;  // X4MP_LEGACY_NET: 1=own socket/recv (legacy), 0=x4mp owns the connection (DEFAULT)
 static int   g_render_interval = 3;    // frames between render passes (20Hz @60fps)
+static std::chrono::steady_clock::time_point g_last_render_time;
+static float g_render_dt = 0.05f;      // seconds between the last two render passes
 static float g_smooth_tau    = 0.12f;  // interpolation time constant (seconds)
 
 // ---- Remote object state --------------------------------------------------
@@ -67,6 +70,13 @@ struct RemoteObj {
     bool has_target = false;
     bool spawned = false;
     bool is_player = false;                            // true for PLAYER ghosts (human ships)
+    bool is_station = false;                           // true for STA ghosts (host-built stations)
+    // Glide (sector-entry convergence without a teleport): when a local ship
+    // is bound while diverged from the host position by <= g_glide_max_m,
+    // px/py/pz hold its current rendered position and gliding=true; the
+    // pinning loop moves it toward (tx,ty,tz) at g_glide_speed. Far diverged
+    // ships (offscreen) snap instantly.
+    bool gliding = false;
 };
 
 static std::unordered_map<unsigned long long, RemoteObj> g_objs;
@@ -87,12 +97,74 @@ static std::vector<UniverseID> g_index_ships;  // local ships in that sector
 static std::unordered_map<std::string, std::vector<size_t>> g_index_by_macro; // macro -> indices
 static std::unordered_map<unsigned long long, UniverseID> g_bindings;  // host id -> local id
 static std::unordered_set<UniverseID> g_bound_locals;                  // local ids bound
+
+// Combat (kill + player-death propagation):
+//   g_kill_q       : host ids / relay keys reported killed by the host (KILL /
+//                    PLAYERDIED lines); removed in render_pass (main thread).
+//   g_pending_acts : ACT lines the player's local combat produced; drained in
+//                    on_frame_update and raised to x4mp ("x4mp.send_act").
+static std::vector<unsigned long long> g_kill_q;
+static std::vector<std::string> g_pending_acts;
+// Combat: (killer, killed) pairs captured from MD "Killed" events. Captured
+// with pure memory reads (no game API) so the callback is worker-thread safe;
+// processed on the main thread in on_frame_update.
+struct KillEvt { uint64_t killer; uint64_t killed; };
+static std::vector<KillEvt> g_md_kills;
+
+// Boarding: entities whose ownership changed (MD "EntityChangedOwner", type
+// 175). Captured with a pure memory read (worker-safe); processed on the main
+// thread. A ship that becomes PLAYER-owned (e.g. captured via boarding) is
+// reported to the host (ACT CAPTURE) so the capture is authoritative.
+struct OwnerEvt { uint64_t entity; };
+static std::vector<OwnerEvt> g_owner_changes;
+static int g_sub_md_owner = -1;
+
+// Boarding enablement: in thin-client mode (INERT=1) every NPC ship is inert,
+// which stops the local simulation of a boarded ship — so a player cannot run a
+// boarding (marines/interior combat) against an inert target. When a boarding
+// operation starts, we EXEMPT the involved ship(s) from inert (let their local
+// sim run) so the boarding proceeds; when it's removed we re-inert them. The
+// capture RESULT still propagates via the owner-change (ACT CAPTURE) path.
+//   g_boarding_exempt : UniverseIDs exempt from inert (inert calls skip these)
+//   g_boarding_evt    : MD BoardingOperationStarted(41)/Removed(40) events
+//   g_boarding_op     : boarding_operation objects (for phase polling)
+struct BoardingEvt { uint64_t entity; uint64_t op; bool started; }; // started=true (41) / false (40)
+static std::vector<BoardingEvt> g_boarding_evt;
+static std::unordered_set<UniverseID> g_boarding_exempt;
+static int g_sub_md_bd_start = -1, g_sub_md_bd_remove = -1;
+
+// ---- Trading: player cargo replication (diff-based) ----------------------
+// The client fully simulates its own sector, including stations + trading.
+// When the player trades, the local cargo changes. We poll the player ship's
+// cargo every g_cargo_interval_ms and, on change, report the snapshot to the
+// host (ACT CARGO). The host applies the diff to the ghost and re-broadcasts
+// it (CARGO <key> ...) so every participant's view of the player's cargo
+// converges. Credits are NOT synced in v1 (no read/set API for the ghost
+// faction's money pool).
+static std::string g_cargo_last_snap;
+static std::chrono::steady_clock::time_point g_cargo_last_send;
+static const int g_cargo_interval_ms = 5000;
+struct CargoSnap { unsigned long long key; std::vector<std::pair<std::string,int>> wares; };
+static std::vector<CargoSnap> g_incoming_cargo; // to apply in render_pass
+// Trading (host-authoritative): station trades broadcast by the host to apply
+// to our local copy of the station.
+struct TradeSnap { unsigned long long uid; float x, y, z; std::vector<std::pair<std::string,int>> deltas; };
+static std::vector<TradeSnap> g_incoming_trades; // to apply in render_pass
+// Boarding: ownership changes to apply (host_id -> new owner faction macro).
+struct CaptureSnap { unsigned long long host_id; std::string faction; };
+static std::vector<CaptureSnap> g_incoming_captures; // to apply in render_pass
 static std::unordered_map<UniverseID, std::chrono::steady_clock::time_point> g_missing_since; // not seen from host
 static bool g_full_received = false;   // full snapshot for the current sector received
 static std::chrono::steady_clock::time_point g_last_recv_any; // last stream data (link alive)
 static float g_bind_radius = 1000.0f;  // X4MP_BIND_RADIUS: re-match distance after a local death (mid-sector)
 static float g_converge_radius = 20000.0f; // X4MP_CONVERGE_RADIUS: match distance on sector entry
 static float g_max_lag_m = 300.0f;     // X4MP_MAX_LAG_M: max interpolation lag behind the host
+// Glide (fixes the highway sector-entry teleport): when a local ship is bound
+// while diverged from the host position, glide it in at g_glide_speed instead of
+// snapping — but only for near divergences (<= g_glide_max_m). Far (offscreen)
+// ships still snap, since their teleport is not visible.
+static float g_glide_speed = 1500.0f;  // X4MP_GLIDE_SPEED: m/s a diverged ship may glide
+static float g_glide_max_m = 20000.0f; // X4MP_GLIDE_MAX: divergence above this snaps instantly
 static bool g_converged = false;        // entry convergence done for the current sector
 // X4MP_CONVERGE_GREEDY (default 1): on sector entry, bind each host ship to the
 // NEAREST same-macro local ship regardless of distance. Inactive sectors diverge
@@ -100,7 +172,11 @@ static bool g_converged = false;        // entry convergence done for the curren
 // the diverged ships (the transition flicker). Greedy binding snaps them to the
 // host position instead (a one-time snap, masked by the sector change).
 static bool g_converge_greedy = true;
-static const int g_missing_prune_ms = 10000; // remove a local ship missing from the host for this long
+static const int g_missing_prune_ms = 30000; // remove a local ship missing from the host for this long
+// (aligned with the 30 s ghost stale threshold: a ship must be genuinely absent
+// from the host's stream for 30 s before we prune its local copy, so brief
+// sector disagreements / ships trading in-and-out of the rendered sector do
+// not cause prune->respawn flicker.)
 static const int g_link_alive_ms = 15000;    // no stream data for this long = link dead (no pruning)
 static bool g_debug = false;             // X4MP_DEBUG=1
 // X4MP_INERT (default 1): stop the local simulation of host-driven ships so the
@@ -290,8 +366,10 @@ static void rebuild_local_index(UniverseID sector) {
     // the index. Re-done on every sector entry (the game may re-activate ships
     // when the sector becomes live again).
     if (g_inert && g_game->ActivateObject) {
-        for (UniverseID s : g_index_ships)
+        for (UniverseID s : g_index_ships) {
+            if (g_boarding_exempt.count(s)) continue; // boarding in progress: keep simulated
             g_game->ActivateObject(s, false);
+        }
     }
     if (g_api && g_api->log) {
         char m[256];
@@ -330,7 +408,9 @@ static void parse_line(char* line) {
                    &id, sectormacro, &x, &y, &z, &yaw, &pitch, &roll, faction, macro) == 10) {
             std::lock_guard<std::mutex> lk(g_mutex);
             RemoteObj& o = g_objs[id];
-            if (o.has_target) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
+            // Don't reset the glide start position (o.px) while a convergence
+            // glide is in progress — only advance the target (o.tx).
+            if (o.has_target && !o.gliding) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
             o.host_id = id;
             snprintf(o.macro, sizeof(o.macro), "%s", macro[0] ? macro : "?");
             snprintf(o.faction, sizeof(o.faction), "%s", faction[0] ? faction : "player");
@@ -355,7 +435,7 @@ static void parse_line(char* line) {
         if (nf >= 9) {
             std::lock_guard<std::mutex> lk(g_mutex);
             RemoteObj& o = g_objs[cid];
-            if (o.has_target) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
+            if (o.has_target && !o.gliding) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
             o.host_id = cid;
             snprintf(o.macro, sizeof(o.macro), "%s", macro[0] ? macro : "?");
             snprintf(o.faction, sizeof(o.faction), "%s", faction[0] ? faction : "player");
@@ -367,6 +447,99 @@ static void parse_line(char* line) {
             o.tx = x; o.ty = y; o.tz = z; o.tyaw = yaw; o.tpitch = pitch; o.troll = roll;
             o.last_update = std::chrono::steady_clock::now();
             o.has_target = true;
+        }
+    } else if (strncmp(line, "STA", 3) == 0) {
+        // STA <id> <sectormacro> <x> <y> <z> <yaw> <pitch> <roll> <faction> <macro>
+        // A station the HOST player built after load. Spawned as a ghost (never
+        // bound — it is static and not in the local ship index). The host
+        // re-sends every ~10 s, so last_update stays fresh (no stale drop).
+        unsigned long long id;
+        float x, y, z, yaw, pitch, roll;
+        char sectormacro[160], faction[80], macro[160];
+        if (sscanf(line, "STA %llu %159s %f %f %f %f %f %f %79s %159s",
+                   &id, sectormacro, &x, &y, &z, &yaw, &pitch, &roll, faction, macro) == 10) {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            RemoteObj& o = g_objs[id];
+            if (o.has_target) { o.px = o.tx; o.py = o.ty; o.pz = o.tz; }
+            o.host_id = id;
+            snprintf(o.macro, sizeof(o.macro), "%s", macro[0] ? macro : "?");
+            snprintf(o.faction, sizeof(o.faction), "%s", faction[0] ? faction : "player");
+            snprintf(o.sector_macro, sizeof(o.sector_macro), "%s", sectormacro[0] ? sectormacro : "?");
+            o.is_station = true;
+            o.tx = x; o.ty = y; o.tz = z; o.tyaw = yaw; o.tpitch = pitch; o.troll = roll;
+            o.last_update = std::chrono::steady_clock::now();
+            o.has_target = true;
+        }
+    } else if (strncmp(line, "KILL", 4) == 0 || strncmp(line, "PLAYERDIED", 10) == 0) {
+        // KILL <host_id>       : the host removed ship host_id (a player kill).
+        // PLAYERDIED <key>     : another client's player ghost (keyed by its relay
+        //                        key) was removed because that player died.
+        // Both mean: drop the matching RemoteObj (its spawned ghost) and its
+        // binding (the bound local ship), so every client shows the ship gone.
+        // Removal is deferred to render_pass (main thread) via g_kill_q — parse
+        // may run on a background thread in legacy mode.
+        unsigned long long id = 0;
+        if (sscanf(line, "%*s %llu", &id) == 1 && id) {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_kill_q.push_back(id);
+        }
+    } else if (strncmp(line, "CARGO", 5) == 0) {
+        // CARGO <key> <n> <ware1> <amt1> <ware2> <amt2> ...
+        // The host broadcast a player's cargo snapshot. Apply it to our ghost of
+        // that player (keyed by relay key) in render_pass (main thread).
+        unsigned long long key;
+        int n;
+        if (sscanf(line, "CARGO %llu %d", &key, &n) == 2 && key && n >= 0) {
+            // Tokenise the whole line; tokens[0]="CARGO" [1]=key [2]=n then
+            // ware/amount pairs.
+            std::vector<std::string> tokens;
+            const char* s = line;
+            while (*s) {
+                while (*s == ' ') s++;
+                if (!*s) break;
+                const char* st = s;
+                while (*s && *s != ' ') s++;
+                tokens.push_back(std::string(st, (size_t)(s - st)));
+            }
+            std::vector<std::pair<std::string,int>> wares;
+            for (size_t i = 3; i + 1 < tokens.size(); i += 2)
+                wares.push_back({ tokens[i], atoi(tokens[i + 1].c_str()) });
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_incoming_cargo.push_back({ key, std::move(wares) });
+        }
+    } else if (strncmp(line, "CAPTURE", 7) == 0) {
+        // CAPTURE <host_id> <faction_macro>
+        // The host made a capture authoritative (a player boarded + took a
+        // ship). Apply the ownership change to our copy (bound local or ghost)
+        // in render_pass.
+        unsigned long long hid;
+        char fac[80];
+        if (sscanf(line, "CAPTURE %llu %79s", &hid, fac) == 2 && hid) {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_incoming_captures.push_back({ hid, fac });
+        }
+    } else if (strncmp(line, "TRADE", 5) == 0) {
+        // TRADE <uid> <x> <y> <z> <ware> <delta>... — a station trade the host
+        // applied authoritatively; apply it to our local copy of that station
+        // in render_pass (uid fast-path, else position match).
+        unsigned long long uid; float x, y, z;
+        if (sscanf(line, "TRADE %llu %f %f %f", &uid, &x, &y, &z) == 4) {
+            std::vector<std::string> toks;
+            const char* p = line + 6;
+            while (*p) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                const char* st = p;
+                while (*p && *p != ' ') p++;
+                toks.push_back(std::string(st, (size_t)(p - st)));
+            }
+            std::vector<std::pair<std::string,int>> deltas;
+            for (size_t i = 4; i + 1 < toks.size(); i += 2)
+                deltas.push_back({ toks[i], atoi(toks[i + 1].c_str()) });
+            if (!deltas.empty()) {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                g_incoming_trades.push_back({ uid, x, y, z, std::move(deltas) });
+            }
         }
     }
 }
@@ -469,6 +642,163 @@ static void recv_loop() {
 // ---- Main-thread render pass ----------------------------------------------
 // Interpolate each ghost toward its target and position it. Only touches the
 // game API from the main thread (called from on_frame_update).
+// ---- Trading: cargo snapshot read + send (client) ------------------------
+// Read the player ship's cargo and, if it changed since the last send, raise
+// an ACT CARGO line to x4mp (which forwards it to the host). Runs on the main
+// thread (called from on_frame_update) so game API calls are safe.
+// Parse a cargo snapshot string ("ware amt ware amt ...") into a map.
+static std::unordered_map<std::string,int> parse_cargo_snap(const std::string& s) {
+    std::unordered_map<std::string,int> m;
+    std::istringstream iss(s);
+    std::string ware; int amt;
+    while (iss >> ware >> amt) m[ware] = amt;
+    return m;
+}
+
+static void maybe_send_cargo() {
+    if (!g_game || !g_api || !g_api->raise_event) return;
+    // Only an actively-receiving client syncs cargo (host-side x4mp_stream is
+    // inert — its link never goes alive).
+    auto now = std::chrono::steady_clock::now();
+    bool link_alive = (now - g_last_recv_any) < std::chrono::milliseconds(g_link_alive_ms);
+    if (!link_alive) return;
+    if ((now - g_cargo_last_send) < std::chrono::milliseconds(g_cargo_interval_ms)) return;
+    g_cargo_last_send = now;
+    if (!g_game->GetNumCargo || !g_game->GetCargo) return;
+    // Find the player's cargo ship (docked players have none).
+    PlayerShipIDs pids;
+    UniverseID ship = pids.ids[0] ? pids.ids[0] : (pids.ids[2] ? pids.ids[2] : pids.ids[1]);
+    if (!ship) return;
+    // Current ship cargo as a map.
+    std::unordered_map<std::string,int> cur;
+    uint32_t n = g_game->GetNumCargo(ship, "");
+    if (n > 0) {
+        std::vector<UIWareInfo> buf(n);
+        uint32_t got = g_game->GetCargo(buf.data(), n, ship, "");
+        for (uint32_t i = 0; i < got; i++)
+            if (buf[i].ware) cur[buf[i].ware] = buf[i].amount;
+    }
+    std::unordered_map<std::string,int> prev = parse_cargo_snap(g_cargo_last_snap);
+    if (cur == prev) return; // unchanged
+    // Build the snapshot string (for ACT CARGO).
+    std::string snap;
+    for (auto& kv : cur) { snap += kv.first; snap += " "; snap += std::to_string(kv.second); snap += " "; }
+    // Only report when the ship actually carries cargo. This avoids a flaky
+    // GetNumCargo (returning 0 while cargo exists) from sending an empty
+    // snapshot that would clear the ghost's cargo.
+    if (cur.empty()) { g_cargo_last_snap = snap; return; }
+    g_cargo_last_snap = snap;
+    char act[16384];
+    // Format: ACT CARGO <count> <ware> <amt> <ware> <amt> ...
+    snprintf(act, sizeof(act), "ACT CARGO %d %s\n", (int)cur.size(), snap.c_str());
+    if (g_debug) net_log("x4mp_stream: [DBG] cargo changed -> ACT CARGO");
+    g_api->raise_event("x4mp.send_act", (void*)act);
+    // Trading (host-authoritative): if the player is docked at a station, the
+    // ship's cargo delta IS the trade — the station changed by the INVERSE.
+    // Relay the discrete trade so the host applies it once (no state drift).
+    UniverseID station = g_game->GetContextByClass ? g_game->GetContextByClass(ship, "station", true) : 0;
+    if (station && g_game->IsValidComponent && g_game->IsValidComponent(station)) {
+        // station_delta[ware] = prev[ware] - cur[ware] (ship gains => station
+        // loses). Iterate the union of wares.
+        std::unordered_set<std::string> wares;
+        for (auto& kv : cur)  wares.insert(kv.first);
+        for (auto& kv : prev) wares.insert(kv.first);
+        std::string body;
+        for (auto& w : wares) {
+            int p = prev.count(w) ? prev[w] : 0;
+            int c = cur.count(w)  ? cur[w]  : 0;
+            int d = p - c;
+            if (d != 0) { body += w; body += " "; body += std::to_string(d); body += " "; }
+        }
+        if (body.empty()) return;
+        UIPosRot sp = g_game->GetObjectPositionInSector(station);
+        char tact[16384];
+        snprintf(tact, sizeof(tact), "ACT TRADE %llu %.1f %.1f %.1f %s\n",
+                 (unsigned long long)station, sp.x, sp.y, sp.z, body.c_str());
+        if (g_debug) net_log("x4mp_stream: [DBG] trade at station -> ACT TRADE");
+        g_api->raise_event("x4mp.send_act", (void*)tact);
+    }
+}
+
+// ---- Trading: apply a cargo snapshot to a local (ghost) ship --------------
+// Diff the ghost's current cargo against `target` and converge it using
+// AddTradeWare (buys, one call per unit) and DropCargo (sells, bulk). Called on
+// the main thread (render_pass).
+static void apply_cargo_to_ghost(UniverseID ghost, const std::vector<std::pair<std::string,int>>& target) {
+    if (!ghost || !g_game || !g_game->IsValidComponent || !g_game->IsValidComponent(ghost)) return;
+    if (!g_game->GetNumCargo || !g_game->GetCargo) return;
+    std::unordered_map<std::string,int> cur;
+    uint32_t n = g_game->GetNumCargo(ghost, "");
+    if (n > 0) {
+        std::vector<UIWareInfo> buf(n);
+        uint32_t got = g_game->GetCargo(buf.data(), n, ghost, "");
+        for (uint32_t i = 0; i < got; i++)
+            if (buf[i].ware) cur[buf[i].ware] = buf[i].amount;
+    }
+    // Sell / drop what we carry more than the target (and anything extra).
+    for (auto& kv : cur) {
+        int tgt = 0;
+        for (auto& t : target) if (t.first == kv.first) { tgt = t.second; break; }
+        int delta = kv.second - tgt;
+        if (delta > 0 && g_game->DropCargo)
+            g_game->DropCargo(ghost, kv.first.c_str(), (uint32_t)delta);
+    }
+    // Buy / add what the target has more than we carry.
+    for (auto& t : target) {
+        int curamt = cur.count(t.first) ? cur[t.first] : 0;
+        int delta = t.second - curamt;
+        if (delta > 0 && g_game->AddTradeWare) {
+            for (int i = 0; i < delta; i++) g_game->AddTradeWare(ghost, t.first.c_str());
+        }
+    }
+    if (g_debug) {
+        char d[160];
+        snprintf(d, sizeof(d), "x4mp_stream: [DBG] applied cargo to ghost %llu (%zu wares)",
+                 (unsigned long long)ghost, target.size());
+        net_log(d);
+    }
+}
+
+// Trading: locate the station a broadcast trade happened at (uid fast-path —
+// same save => static-object IDs match — else position match; stations are
+// static). Called on the main thread (render_pass).
+static UniverseID find_station_by_trade(unsigned long long uid, float x, float y, float z) {
+    if (!g_game || !g_game->IsValidComponent) return 0;
+    if (uid && g_game->IsValidComponent((UniverseID)uid)) return (UniverseID)uid;
+    if (!g_game->GetAllFactions || !g_game->GetAllFactionStations ||
+        !g_game->GetObjectPositionInSector) return 0;
+    const char* factions[64];
+    uint32_t nf = g_game->GetAllFactions(factions, 64, true);
+    UniverseID best = 0; float best_d2 = 50.0f * 50.0f;
+    for (uint32_t f = 0; f < nf; f++) {
+        uint32_t cap = g_game->GetNumAllFactionStations ? g_game->GetNumAllFactionStations(factions[f]) : 0;
+        if (cap == 0) continue;
+        std::vector<UniverseID> stns(cap);
+        uint32_t ns = g_game->GetAllFactionStations(stns.data(), cap, factions[f]);
+        for (uint32_t i = 0; i < ns; i++) {
+            UniverseID s = stns[i];
+            if (!g_game->IsValidComponent(s)) continue;
+            UIPosRot p = g_game->GetObjectPositionInSector(s);
+            float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < best_d2) { best_d2 = d2; best = s; }
+        }
+    }
+    return best;
+}
+
+static void apply_trade_to_station(UniverseID station, const std::vector<std::pair<std::string,int>>& deltas) {
+    if (!station || !g_game || !g_game->IsValidComponent || !g_game->IsValidComponent(station)) return;
+    for (auto& d : deltas) {
+        if (d.second < 0) {
+            if (g_game->DropCargo) g_game->DropCargo(station, d.first.c_str(), (uint32_t)(-d.second));
+        } else if (d.second > 0) {
+            if (g_game->AddTradeWare)
+                for (int i = 0; i < d.second; i++) g_game->AddTradeWare(station, d.first.c_str());
+        }
+    }
+}
+
 static void render_pass() {
     if (!g_game) return;
     // Do NOT touch the object system until the universe is fully built (2nd
@@ -494,9 +824,84 @@ static void render_pass() {
     }
 
     auto now = std::chrono::steady_clock::now();
+    if (g_last_render_time.time_since_epoch().count() > 0) {
+        g_render_dt = std::chrono::duration_cast<std::chrono::duration<float>>(now - g_last_render_time).count();
+        if (g_render_dt <= 0.0f) g_render_dt = 0.001f;
+        if (g_render_dt > 0.5f) g_render_dt = 0.5f; // clamp stalls (tab-out etc.)
+    }
+    g_last_render_time = now;
     bool link_alive = (now - g_last_recv_any) < std::chrono::milliseconds(g_link_alive_ms);
 
     std::lock_guard<std::mutex> lk(g_mutex);
+    // Combat: remove ships/ghosts the host reported as killed (KILL) or whose
+    // player died (PLAYERDIED). Runs here — main thread, locked — so it shares
+    // render_pass's access to g_objs/g_bindings. PlayerShipIDs guards against
+    // ever removing the player's own ship (that would abort to the menu).
+    if (!g_kill_q.empty()) {
+        std::vector<unsigned long long> kills = std::move(g_kill_q);
+        g_kill_q.clear();
+        for (unsigned long long hid : kills) {
+            auto it = g_objs.find(hid);
+            if (it == g_objs.end()) continue;
+            RemoteObj& o = it->second;
+            PlayerShipIDs pids;
+            if (o.spawned && o.client_id && !pids.contains(o.client_id)
+                && g_game->IsValidComponent(o.client_id)) {
+                g_game->RemoveComponent(o.client_id);
+                if (g_debug) { char d[120]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] KILL removed ghost host=%llu", (unsigned long long)hid); net_log(d); }
+            }
+            auto bit = g_bindings.find(hid);
+            if (bit != g_bindings.end()) {
+                UniverseID local = bit->second;
+                if (!pids.contains(local) && g_game->IsValidComponent(local)) {
+                    g_game->RemoveComponent(local);
+                    if (g_debug) { char d[160]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] KILL removed local ship host=%llu local=%llu", (unsigned long long)hid, (unsigned long long)local); net_log(d); }
+                }
+                g_bound_locals.erase(local);
+                g_bindings.erase(bit);
+            }
+            g_objs.erase(it);
+        }
+    }
+    // Boarding: apply any ownership changes the host broadcast (captures).
+    if (!g_incoming_captures.empty()) {
+        std::vector<CaptureSnap> caps = std::move(g_incoming_captures);
+        g_incoming_captures.clear();
+        for (auto& cs : caps) {
+            UniverseID target = 0;
+            auto it = g_objs.find(cs.host_id);
+            if (it != g_objs.end() && it->second.spawned && it->second.client_id) target = it->second.client_id;
+            auto bit = g_bindings.find(cs.host_id);
+            if (bit != g_bindings.end()) target = bit->second;
+            if (target && g_game->SetComponentOwner && g_game->IsValidComponent(target)) {
+                g_game->SetComponentOwner(target, cs.faction.c_str());
+                if (g_debug) { char d[160]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] applied CAPTURE host=%llu -> faction %s (local=%llu)", (unsigned long long)cs.host_id, cs.faction.c_str(), (unsigned long long)target); net_log(d); }
+            }
+        }
+    }
+    // Trading: apply any cargo snapshots the host broadcast for other players.
+    if (!g_incoming_cargo.empty()) {
+        std::vector<CargoSnap> snaps = std::move(g_incoming_cargo);
+        g_incoming_cargo.clear();
+        for (auto& cs : snaps) {
+            auto it = g_objs.find(cs.key);
+            if (it == g_objs.end() || !it->second.spawned || !it->second.client_id) continue;
+            apply_cargo_to_ghost(it->second.client_id, cs.wares);
+        }
+    }
+    // Trading: apply any station trades the host broadcast (our local station
+    // copy). uid fast-path, else position match (stations are static).
+    if (!g_incoming_trades.empty()) {
+        std::vector<TradeSnap> trades = std::move(g_incoming_trades);
+        g_incoming_trades.clear();
+        for (auto& tr : trades) {
+            UniverseID stn = find_station_by_trade(tr.uid, tr.x, tr.y, tr.z);
+            if (stn) {
+                apply_trade_to_station(stn, tr.deltas);
+                if (g_debug) { char d[160]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] applied TRADE to station %llu (%d wares)", (unsigned long long)stn, (int)tr.deltas.size()); net_log(d); }
+            }
+        }
+    }
     std::vector<unsigned long long> dead;
     static unsigned dbg_tick = 0;
     static unsigned spawned_total = 0;
@@ -553,20 +958,37 @@ static void render_pass() {
         // Speed-adaptive: a fixed tau lags the host by v*tau (1.8 km behind at
         // highway speed 15 km/s with tau=0.12) — cap the steady-state lag at
         // g_max_lag_m by shrinking tau for fast objects.
+        // GLIDE: a freshly-bound (converged) ship that is still far from the
+        // host position glides in at g_glide_speed instead of snapping — this
+        // is what removes the highway sector-entry teleport.
         float dt = std::chrono::duration_cast<std::chrono::duration<float>>(now - o.last_update).count();
         float ddx = o.tx - o.px, ddy = o.ty - o.py, ddz = o.tz - o.pz;
         float dist = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
-        float v_est = dist / fmaxf(dt, 0.001f); // upper bound on speed (includes catch-up)
-        float tau = g_smooth_tau > 0 ? g_smooth_tau : 0.12f;
-        if (v_est > 1.0f) {
-            float tau_fast = g_max_lag_m / v_est;
-            if (tau_fast < tau) tau = tau_fast;
+        float ix, iy, iz;
+        if (o.gliding) {
+            float maxstep = g_glide_speed * g_render_dt;
+            if (dist <= maxstep + 200.0f) {
+                ix = o.tx; iy = o.ty; iz = o.tz;
+                o.px = o.tx; o.py = o.ty; o.pz = o.tz;
+                o.gliding = false;
+            } else {
+                float s = (maxstep > 0.0f) ? (maxstep / dist) : 1.0f;
+                ix = o.px + ddx * s; iy = o.py + ddy * s; iz = o.pz + ddz * s;
+                o.px = ix; o.py = iy; o.pz = iz;
+            }
+        } else {
+            float v_est = dist / fmaxf(dt, 0.001f); // upper bound on speed (includes catch-up)
+            float tau = g_smooth_tau > 0 ? g_smooth_tau : 0.12f;
+            if (v_est > 1.0f) {
+                float tau_fast = g_max_lag_m / v_est;
+                if (tau_fast < tau) tau = tau_fast;
+            }
+            float alpha = 1.0f - expf(-dt / fmaxf(tau, 0.005f));
+            if (alpha > 1.0f) alpha = 1.0f;
+            ix = o.px + (o.tx - o.px) * alpha;
+            iy = o.py + (o.ty - o.py) * alpha;
+            iz = o.pz + (o.tz - o.pz) * alpha;
         }
-        float alpha = 1.0f - expf(-dt / fmaxf(tau, 0.005f));
-        if (alpha > 1.0f) alpha = 1.0f;
-        float ix = o.px + (o.tx - o.px) * alpha;
-        float iy = o.py + (o.ty - o.py) * alpha;
-        float iz = o.pz + (o.tz - o.pz) * alpha;
 
         UIPosRot pos; pos.x = ix; pos.y = iy; pos.z = iz;
         pos.yaw = o.tyaw; pos.pitch = o.tpitch; pos.roll = o.troll;
@@ -607,6 +1029,28 @@ static void render_pass() {
                     g_game->RemoveComponent(o.client_id);
                 g_flk_zone++;
                 dead.push_back(kv.first);
+            }
+            continue;
+        }
+
+        // ---- Station ghosts (host-built, issue 3) -------------------------
+        // Spawn once when the client is in the station's sector; never bind
+        // (stations are static and not in the local ship index); no per-frame
+        // updates. The zone-cleanup above already drops the RemoteObj (and the
+        // ghost) when the client leaves the sector, so it re-spawns on return.
+        if (o.is_station) {
+            if (!o.spawned) {
+                UniverseID newid = g_game->SpawnObjectAtPos2(o.macro, target_sector, pos,
+                                                            (o.faction[0]) ? o.faction : "player");
+                if (newid != 0) {
+                    o.client_id = newid;
+                    o.spawned = true;
+                    spawned_total++;
+                    char dbg[200];
+                    snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] SPAWN STATION id=%llu macro=%s at (%.0f,%.0f,%.0f) sector=%s",
+                             (unsigned long long)kv.first, o.macro, ix, iy, iz, o.sector_macro);
+                    net_log(dbg);
+                }
             }
             continue;
         }
@@ -666,10 +1110,33 @@ static void render_pass() {
                         g_game->RemoveComponent(o.client_id);
                     o.spawned = false;
                     o.client_id = 0;
-                    // Snap the local ship to the host's current state.
-                    UIPosRot snap; snap.x = o.tx; snap.y = o.ty; snap.z = o.tz;
-                    snap.yaw = o.tyaw; snap.pitch = o.tpitch; snap.roll = o.troll;
-                    g_game->SetObjectSectorPos(local, client_sector, snap);
+                    // Initialize the convergence. If the local ship is within
+                    // g_glide_max_m of the host position, GLIDE it in (the
+                    // pinning loop moves it at g_glide_speed) — no sector-entry
+                    // teleport for visible ships. Far (offscreen) ships snap.
+                    {
+                        UIPosRot lp = g_game->GetObjectPositionInSector(local);
+                        float dx = o.tx - lp.x, dy = o.ty - lp.y, dz = o.tz - lp.z;
+                        float d2 = dx*dx + dy*dy + dz*dz;
+                        if (d2 <= g_glide_max_m * g_glide_max_m) {
+                            o.px = lp.x; o.py = lp.y; o.pz = lp.z; // glide from here
+                            o.gliding = true;
+                            if (g_debug) {
+                                char dbg[160];
+                                snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] GLIDE host=%llu local=%llu from (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f) dist=%.0fm",
+                                         (unsigned long long)kv.first, (unsigned long long)local,
+                                         lp.x, lp.y, lp.z, o.tx, o.ty, o.tz, sqrtf(d2));
+                                net_log(dbg);
+                            }
+                            // No instant snap; the per-frame pinning glides it.
+                        } else {
+                            o.px = o.tx; o.py = o.ty; o.pz = o.tz;
+                            o.gliding = false;
+                            UIPosRot snap; snap.x = o.tx; snap.y = o.ty; snap.z = o.tz;
+                            snap.yaw = o.tyaw; snap.pitch = o.tpitch; snap.roll = o.troll;
+                            g_game->SetObjectSectorPos(local, client_sector, snap);
+                        }
+                    }
                     bound_now++;
                 }
             } else {
@@ -678,7 +1145,8 @@ static void render_pass() {
                 // AI/visuals, but position follows the host's truth — so all
                 // clients + host show the same ship state at any speed
                 // (a drift threshold can't keep up at 15 km/s).
-                if (g_inert && g_game->ActivateObject) g_game->ActivateObject(local, false);
+                if (g_inert && g_game->ActivateObject && !g_boarding_exempt.count(local))
+                    g_game->ActivateObject(local, false);
                 g_game->SetObjectSectorPos(local, client_sector, pos);
                 corrected++;
             }
@@ -714,7 +1182,8 @@ static void render_pass() {
                 o.spawned = false; // ghost was destroyed; respawn next pass
                 continue;
             }
-            if (g_inert && g_game->ActivateObject) g_game->ActivateObject(o.client_id, false);
+            if (g_inert && g_game->ActivateObject && !g_boarding_exempt.count(o.client_id))
+                g_game->ActivateObject(o.client_id, false);
             g_game->SetObjectSectorPos(o.client_id, target_sector, pos);
         }
     }
@@ -832,8 +1301,27 @@ static void autofly_tick() {
     }
 }
 
+static void process_md_kills(); // fwd (defined below, near the MD callback)
+static void process_owner_changes(); // fwd (defined below)
+static void process_boarding_events(); // fwd (defined below)
+
 static void on_frame_update(const char* /*name*/, void* /*data*/, void* /*ud*/) {
     autofly_tick();
+    // Trading: poll the player ship's cargo and report changes to the host.
+    maybe_send_cargo();
+    // Combat: process captured MD kill events (main thread) -> pending ACTs.
+    process_md_kills();
+    // Boarding: process captured ownership changes (main thread) -> ACT CAPTURE.
+    process_owner_changes();
+    // Boarding: exempt involved ships from inert so a local boarding can run.
+    process_boarding_events();
+    // Combat: flush any ACT lines the player's local combat produced (kills /
+    // death) to x4mp, which sends them over the control channel to the host.
+    if (!g_pending_acts.empty() && g_api && g_api->raise_event) {
+        std::vector<std::string> acts;
+        { std::lock_guard<std::mutex> lk(g_mutex); acts = std::move(g_pending_acts); g_pending_acts.clear(); }
+        for (auto& a : acts) g_api->raise_event("x4mp.send_act", (void*)a.c_str());
+    }
     static unsigned tick = 0;
     if ((++tick % (unsigned)(g_render_interval > 0 ? g_render_interval : 3)) != 0) return;
     render_pass();
@@ -860,6 +1348,160 @@ static void on_universe_ready(const char* /*name*/, void* /*data*/, void* /*ud*/
 static int g_sub_tick = -1;
 static int g_sub_universe = -1;
 static int g_sub_data = -1;
+static int g_sub_md_killed = -1;
+
+// ---- Combat detection (client): the player's local kills / death ----------
+// The client fully simulates its own sector, including its own combat. When the
+// player kills an enemy ship (or the player's ship is destroyed), the local
+// game has already resolved it — we only need to tell the host so its
+// authoritative copy is removed and re-broadcast to every client. Detection uses
+// the MD "Killed" event (type 237). Layout-compatible with X4MdEvent:
+//   { uint32 type_id; uint64 source_id; double ts; void* raw_event }
+// where source_id = the KILLED entity and raw_event+0x18 = the KILLER.
+struct MdEv { uint32_t type_id; uint64_t source_id; double ts; void* raw_event; };
+
+static unsigned long long host_id_for_local(UniverseID local) {
+    if (!local) return 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (auto& kv : g_bindings) if (kv.second == local) return kv.first;
+    return 0;
+}
+
+static void on_md_killed(const char* /*name*/, void* data, void* /*ud*/) {
+    if (!data) return;
+    // Only an actively-receiving CLIENT replicates combat. On the host,
+    // x4mp_stream receives no stream data, so the link never goes alive and
+    // this is a no-op there. This keeps host-side x4mp_stream inert.
+    bool link_alive = (std::chrono::steady_clock::now() - g_last_recv_any)
+                       < std::chrono::milliseconds(g_link_alive_ms);
+    if (!link_alive) return;
+    auto* ev = static_cast<MdEv*>(data);
+    // Pure memory reads only — NO game API calls here (the MD dispatch thread
+    // may be a worker; game API calls must happen on the main thread).
+    auto* p = static_cast<const uint8_t*>(ev->raw_event);
+    uint64_t killer = p ? *reinterpret_cast<const uint64_t*>(p + 0x18) : 0;
+    uint64_t killed = ev->source_id;
+    if (!killed) return;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_md_kills.push_back({ killer, killed });
+    if (g_md_kills.size() > 256) g_md_kills.erase(g_md_kills.begin()); // bound
+}
+
+// Boarding: capture the entity whose ownership changed (pure memory read —
+// worker-safe). The owner macro + player comparison happens on the main thread.
+static void on_md_owner(const char* /*name*/, void* data, void* /*ud*/) {
+    if (!data) return;
+    bool link_alive = (std::chrono::steady_clock::now() - g_last_recv_any)
+                       < std::chrono::milliseconds(g_link_alive_ms);
+    if (!link_alive) return;
+    auto* ev = static_cast<MdEv*>(data);
+    // EntityChangedOwnerData: entity_changing_ownership at raw_event + 0x18.
+    auto* p = static_cast<const uint8_t*>(ev->raw_event);
+    uint64_t entity = p ? *reinterpret_cast<const uint64_t*>(p + 0x18) : ev->source_id;
+    if (!entity) return;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_owner_changes.push_back({ entity });
+    if (g_owner_changes.size() > 256) g_owner_changes.erase(g_owner_changes.begin());
+}
+
+// Boarding (main thread): an entity that became PLAYER-owned is a capture
+// (e.g. via boarding). If it is a bound ship, report ACT CAPTURE <host_id> so
+// the host makes the capture authoritative. Skips unbound entities (NPC
+// ownership churn in sectors we don't render).
+static void process_owner_changes() {
+    std::vector<OwnerEvt> changes;
+    { std::lock_guard<std::mutex> lk(g_mutex); changes = std::move(g_owner_changes); g_owner_changes.clear(); }
+    if (changes.empty()) return;
+    if (!g_game || !g_game->GetPlayerObjectID || !g_game->GetOwnerDetails2) return;
+    // The player faction macro (owner of the player's ship/object).
+    UniverseID pobj = g_game->GetPlayerObjectID();
+    if (!pobj) return;
+    const char* player_fac = g_game->GetOwnerDetails2(pobj).factionID;
+    if (!player_fac) return;
+    for (auto& oc : changes) {
+        if (!g_game->IsValidComponent || !g_game->IsValidComponent((UniverseID)oc.entity)) continue;
+        const char* newfac = g_game->GetOwnerDetails2((UniverseID)oc.entity).factionID;
+        if (!newfac || strcmp(newfac, player_fac) != 0) continue; // not a player capture
+        unsigned long long hid = host_id_for_local((UniverseID)oc.entity);
+        if (!hid) continue; // unbound (no host counterpart)
+        if (g_debug) { char d[140]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] player capture -> ACT CAPTURE host=%llu fac=%s", (unsigned long long)hid, newfac); net_log(d); }
+        char act[64]; snprintf(act, sizeof(act), "ACT CAPTURE %llu\n", (unsigned long long)hid);
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_pending_acts.push_back(act);
+    }
+}
+
+// Boarding MD callbacks (worker-thread safe: pure memory reads only).
+// BoardingOperationStartedData (41) / RemovedData (40): source_id = involved
+// entity, raw_event+0x18 = the boarding_operation object.
+static void on_md_boarding(const char* /*name*/, void* data, void* /*ud*/) {
+    if (!data) return;
+    bool link_alive = (std::chrono::steady_clock::now() - g_last_recv_any)
+                       < std::chrono::milliseconds(g_link_alive_ms);
+    if (!link_alive) return;
+    auto* ev = static_cast<MdEv*>(data);
+    auto* p = static_cast<const uint8_t*>(ev->raw_event);
+    uint64_t op = p ? *reinterpret_cast<const uint64_t*>(p + 0x18) : 0;
+    uint64_t entity = ev->source_id; // involved ship (target/boarder)
+    bool started = (ev->type_id == 41);
+    if (!entity && op) entity = op;
+    if (!entity) return;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_boarding_evt.push_back({ entity, op, started });
+    if (g_boarding_evt.size() > 256) g_boarding_evt.erase(g_boarding_evt.begin());
+}
+
+// Boarding (main thread): exempt involved ships from inert so a local boarding
+// can run in thin-client mode; re-inert when the operation is removed. Player
+// ships are never touched (PlayerShipIDs guard).
+static void process_boarding_events() {
+    std::vector<BoardingEvt> evts;
+    { std::lock_guard<std::mutex> lk(g_mutex); evts = std::move(g_boarding_evt); g_boarding_evt.clear(); }
+    if (evts.empty()) return;
+    if (!g_game || !g_game->IsValidComponent || !g_game->ActivateObject) return;
+    for (auto& e : evts) {
+        UniverseID s = (UniverseID)e.entity;
+        if (!g_game->IsValidComponent(s)) continue;
+        if (e.started) {
+            g_boarding_exempt.insert(s);
+            g_game->ActivateObject(s, true); // let the local sim run for the boarding
+            if (g_debug) { char d[140]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] boarding started: exempt ship %llu from inert (op=%llu)", (unsigned long long)s, (unsigned long long)e.op); net_log(d); }
+        } else {
+            g_boarding_exempt.erase(s);
+            if (g_inert) g_game->ActivateObject(s, false); // re-inert
+            if (g_debug) { char d[140]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] boarding removed: re-inert ship %llu", (unsigned long long)s); net_log(d); }
+        }
+    }
+}
+
+// Combat: process captured kill events on the MAIN thread (game APIs are safe
+// here). Called from on_frame_update.
+static void process_md_kills() {
+    std::vector<KillEvt> kills;
+    { std::lock_guard<std::mutex> lk(g_mutex); kills = std::move(g_md_kills); g_md_kills.clear(); }
+    if (kills.empty()) return;
+    PlayerShipIDs pids; // built once for this batch (main thread, safe)
+    for (auto& k : kills) {
+        if (pids.contains((UniverseID)k.killed)) {
+            // Player's own ship destroyed. NEVER RemoveComponent it locally
+            // (that triggers "Game Over (killmethod=removed)" + menu abort).
+            // Tell the host to drop our ghost; the local game handles our death.
+            if (g_debug) net_log("x4mp_stream: [DBG] player ship killed -> ACT PLAYERDIED");
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_pending_acts.push_back("ACT PLAYERDIED\n");
+        } else if (pids.contains((UniverseID)k.killer) && k.killed) {
+            // Player killed `killed`. Resolve its host id and report the kill so
+            // the host removes its copy and re-broadcasts to the other clients.
+            unsigned long long hid = host_id_for_local((UniverseID)k.killed);
+            if (hid) {
+                if (g_debug) { char d[120]; snprintf(d, sizeof(d), "x4mp_stream: [DBG] player kill -> ACT KILL host=%llu", (unsigned long long)hid); net_log(d); }
+                char act[64]; snprintf(act, sizeof(act), "ACT KILL %llu\n", (unsigned long long)hid);
+                std::lock_guard<std::mutex> lk(g_mutex);
+                g_pending_acts.push_back(act);
+            }
+        }
+    }
+}
 
 X4NATIVE_EXPORT int x4native_api_version(void) { return 1; }
 
@@ -893,6 +1535,10 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     if (in) g_inert = (*in != '0');            // default ON; X4MP_INERT=0 disables
     const char* cg = std::getenv("X4MP_CONVERGE_GREEDY");
     if (cg) g_converge_greedy = (*cg != '0');  // default ON; X4MP_CONVERGE_GREEDY=0 disables
+    const char* gs = std::getenv("X4MP_GLIDE_SPEED");
+    if (gs) { float v = (float)atof(gs); if (v >= 50.0f && v <= 20000.0f) g_glide_speed = v; }
+    const char* gm = std::getenv("X4MP_GLIDE_MAX");
+    if (gm) { float v = (float)atof(gm); if (v >= 1000.0f && v <= 500000.0f) g_glide_max_m = v; }
     const char* af = std::getenv("X4MP_AUTOFLY");
     if (af && *af == '1') g_autofly = true;
     const char* afi = std::getenv("X4MP_AUTOFLY_INTERVAL");
@@ -933,6 +1579,16 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     g_sub_tick = api->subscribe("on_frame_update", on_frame_update, nullptr, api);
     g_sub_universe = api->subscribe("on_universe_ready", on_universe_ready, nullptr, api);
     g_sub_data = api->subscribe("x4mp_stream.data", on_stream_data, nullptr, api);
+    // Combat: detect the player's local kills / death via the MD "Killed"
+    // event (type 237). Gated to active clients inside the callback.
+    if (api->md_subscribe_before) {
+        g_sub_md_killed = api->md_subscribe_before(237, on_md_killed, nullptr, api);
+        // Boarding: detect the player capturing a ship (ownership change).
+        g_sub_md_owner = api->md_subscribe_before(175, on_md_owner, nullptr, api);
+        // Boarding: exempt involved ships from inert so a local boarding runs.
+        g_sub_md_bd_start  = api->md_subscribe_before(41, on_md_boarding, nullptr, api);
+        g_sub_md_bd_remove = api->md_subscribe_before(40, on_md_boarding, nullptr, api);
+    }
 
     char m[200];
     if (g_legacy_net) {
@@ -953,6 +1609,10 @@ X4NATIVE_EXPORT void x4native_shutdown(void) {
     if (g_recv_thread.joinable()) g_recv_thread.join();
     if (g_api && g_api->unsubscribe && g_sub_tick >= 0) g_api->unsubscribe(g_sub_tick);
     if (g_api && g_api->unsubscribe && g_sub_universe >= 0) g_api->unsubscribe(g_sub_universe);
+    if (g_api && g_api->unsubscribe && g_sub_md_killed >= 0) g_api->unsubscribe(g_sub_md_killed);
+    if (g_api && g_api->unsubscribe && g_sub_md_owner >= 0) g_api->unsubscribe(g_sub_md_owner);
+    if (g_api && g_api->unsubscribe && g_sub_md_bd_start >= 0) g_api->unsubscribe(g_sub_md_bd_start);
+    if (g_api && g_api->unsubscribe && g_sub_md_bd_remove >= 0) g_api->unsubscribe(g_sub_md_bd_remove);
     if (g_api && g_api->unsubscribe && g_sub_data >= 0) g_api->unsubscribe(g_sub_data);
     net_log("x4mp_stream: shutting down");
 }

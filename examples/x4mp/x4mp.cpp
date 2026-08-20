@@ -89,6 +89,7 @@ static int             g_sub_loaded = 0;
 static int             g_sub_host  = 0;
 static int             g_sub_join  = 0;
 static int             g_sub_universe = 0; // on_universe_ready (world fully built)
+static int             g_sub_send_act = 0; // x4mp_stream combat ACT lines (client)
 static bool            g_host_done = false;
 static bool            g_join_done = false;
 static bool            g_host_pending = false;
@@ -214,6 +215,13 @@ static std::unordered_set<UniverseID> g_client_station_baseline; // the save's s
 static uint32_t g_client_station_seq = 0;
 static bool g_fleet_reassigned = false; // issue 4: reassignment completed
 static bool client_reassign_player_fleet(); // fwd (defined after net_update)
+
+// HOST side of station replication (issue 3, symmetric to ACT BUILD):
+// the host player's NEW builds (PF stations created after load) are streamed
+// to clients as STA lines so they appear in the clients' universes.
+static std::unordered_set<UniverseID> g_host_station_baseline;
+static bool g_host_station_baseline_done = false;
+static std::unordered_set<UniverseID> g_host_station_sent; // logged-once (still re-sent)
 
 // Host-side cached ship state per client, used to relay to other clients so
 // that clients can see each other. Key = hash of client sockaddr.
@@ -1449,6 +1457,77 @@ static NetClient* find_client(const struct sockaddr_in& from) {
     return nullptr;
 }
 
+// Trading (host): converge a ghost ship's cargo to a target snapshot. Diff the
+// ghost's current cargo (GetCargo) against `target` and apply AddTradeWare
+// (buys) / DropCargo (sells). Called from process_message (main thread).
+static void host_apply_cargo(UniverseID ghost,
+                             const std::vector<std::pair<std::string,int>>& target) {
+    if (!g_game || !ghost || !g_game->IsValidComponent || !g_game->IsValidComponent(ghost)) return;
+    if (!g_game->GetNumCargo || !g_game->GetCargo) return;
+    std::unordered_map<std::string,int> cur;
+    uint32_t n = g_game->GetNumCargo(ghost, "");
+    if (n > 0) {
+        std::vector<UIWareInfo> buf(n);
+        uint32_t got = g_game->GetCargo(buf.data(), n, ghost, "");
+        for (uint32_t i = 0; i < got; i++)
+            if (buf[i].ware) cur[buf[i].ware] = buf[i].amount;
+    }
+    for (auto& kv : cur) {
+        int tgt = 0;
+        for (auto& t : target) if (t.first == kv.first) { tgt = t.second; break; }
+        int delta = kv.second - tgt;
+        if (delta > 0 && g_game->DropCargo)
+            g_game->DropCargo(ghost, kv.first.c_str(), (uint32_t)delta);
+    }
+    for (auto& t : target) {
+        int curamt = cur.count(t.first) ? cur[t.first] : 0;
+        int delta = t.second - curamt;
+        if (delta > 0 && g_game->AddTradeWare)
+            for (int i = 0; i < delta; i++) g_game->AddTradeWare(ghost, t.first.c_str());
+    }
+}
+
+// Trading: locate the station a trade happened at. Primary: the station's
+// UniverseID (both sides load the same save, so static-object IDs match —
+// unlike ships, which diverge via spawn/death). Fallback: enumerate all
+// stations and match by position (within ~50 m) — stations are static.
+static UniverseID find_station_by_trade(unsigned long long uid, float x, float y, float z) {
+    if (!g_game || !g_game->IsValidComponent) return 0;
+    if (uid && g_game->IsValidComponent((UniverseID)uid)) return (UniverseID)uid;
+    if (!g_game->GetAllFactions || !g_game->GetObjectPositionInSector) return 0;
+    const char* factions[64];
+    uint32_t nf = g_game->GetAllFactions(factions, 64, true);
+    UniverseID best = 0; float best_d2 = 50.0f * 50.0f;
+    for (uint32_t f = 0; f < nf; f++) {
+        std::vector<UniverseID> stns;
+        uint32_t ns = enumerate_faction_stations(factions[f], stns);
+        for (uint32_t i = 0; i < ns; i++) {
+            UniverseID s = stns[i];
+            if (g_game->IsValidComponent && !g_game->IsValidComponent(s)) continue;
+            UIPosRot p = g_game->GetObjectPositionInSector(s);
+            float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < best_d2) { best_d2 = d2; best = s; }
+        }
+    }
+    return best;
+}
+
+// Trading: apply a discrete trade to a station. delta < 0 -> the station LOSES
+// that many units (player bought) -> DropCargo (bulk). delta > 0 -> the station
+// GAINS them (player sold) -> AddTradeWare (single-unit, bounded by ship cargo).
+static void host_apply_trade(UniverseID station, const std::vector<std::pair<std::string,int>>& deltas) {
+    if (!station || !g_game || !g_game->IsValidComponent || !g_game->IsValidComponent(station)) return;
+    for (auto& d : deltas) {
+        if (d.second < 0) {
+            if (g_game->DropCargo) g_game->DropCargo(station, d.first.c_str(), (uint32_t)(-d.second));
+        } else if (d.second > 0) {
+            if (g_game->AddTradeWare)
+                for (int i = 0; i < d.second; i++) g_game->AddTradeWare(station, d.first.c_str());
+        }
+    }
+}
+
 static void process_message(const char* msg, const struct sockaddr_in& from) {
     if (g_net_host) {
         if (strncmp(msg, "JOIN", 4) == 0) {
@@ -1556,6 +1635,133 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                             net_debug(dbg);
                         }
                     }
+                }
+            }
+            // Combat: ACT KILL <host_id> — a client's player destroyed ship
+            // host_id (its local sim already removed it). Remove the host's
+            // authoritative copy and re-broadcast so every client drops it.
+            if (strncmp(msg + 4, "KILL", 4) == 0) {
+                unsigned long long hid = 0;
+                if (sscanf(msg + 8, "%llu", &hid) == 1 && hid) {
+                    if (g_game && g_game->IsValidComponent && g_game->RemoveComponent
+                        && g_game->IsValidComponent((UniverseID)hid)) {
+                        g_game->RemoveComponent((UniverseID)hid);
+                        g_host_only_objects.erase((UniverseID)hid);
+                    }
+                    char b[64];
+                    snprintf(b, sizeof(b), "KILL %llu\n", (unsigned long long)hid);
+                    net_send_stream(b); // data channel -> x4mp_stream on all clients
+                    if (g_debug) { char dbg[160]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST kill ship id=%llu (broadcast)", (unsigned long long)hid); net_debug(dbg); }
+                }
+            } else if (strncmp(msg + 4, "PLAYERDIED", 10) == 0) {
+                // Combat: this client's player ship died. Remove its ghost and
+                // relay the death so OTHER clients drop this client's player.
+                uint64_t key = ((uint64_t)from.sin_addr.s_addr << 16) | (uint32_t)ntohs(from.sin_port);
+                auto git = g_client_ships.find(key);
+                if (git != g_client_ships.end()) {
+                    if (g_game && g_game->IsValidComponent && g_game->RemoveComponent
+                        && g_game->IsValidComponent(git->second))
+                        g_game->RemoveComponent(git->second);
+                    g_host_only_objects.erase(git->second);
+                    g_client_ships.erase(git);
+                    g_client_ship_state.erase(key);
+                }
+                char b[64];
+                snprintf(b, sizeof(b), "PLAYERDIED %llu\n", (unsigned long long)key);
+                for (auto& cl : g_clients) {
+                    if (cl.addr.sin_port == from.sin_port && cl.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
+                    net_send_tcp(cl, b, strlen(b));
+                }
+                if (g_debug) { char dbg[160]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST player died (key=%llu), ghost removed + relayed", (unsigned long long)key); net_debug(dbg); }
+            } else if (strncmp(msg + 4, "CARGO", 5) == 0) {
+                // Trading: ACT CARGO <count> <ware> <amt> ... — a client's player
+                // cargo changed. Converge this client's ghost cargo and re-
+                // broadcast so other clients' view of the player matches.
+                uint64_t key = ((uint64_t)from.sin_addr.s_addr << 16) | (uint32_t)ntohs(from.sin_port);
+                // Parse the ware/amount pairs after "ACT CARGO <count>".
+                const char* s = msg;
+                std::vector<std::string> tokens;
+                while (*s) {
+                    while (*s == ' ') s++;
+                    if (!*s) break;
+                    const char* st = s;
+                    while (*s && *s != ' ') s++;
+                    tokens.push_back(std::string(st, (size_t)(s - st)));
+                }
+                // tokens: [ACT][CARGO][count][ware][amt]...
+                if (tokens.size() >= 3) {
+                    std::vector<std::pair<std::string,int>> wares;
+                    for (size_t i = 3; i + 1 < tokens.size(); i += 2)
+                        wares.push_back({ tokens[i], atoi(tokens[i + 1].c_str()) });
+                    auto git = g_client_ships.find(key);
+                    if (git != g_client_ships.end()) {
+                        host_apply_cargo(git->second, wares);
+                    }
+                    // Re-broadcast to the OTHER clients (keyed by this sender's
+                    // key). msg = "ACT CARGO <count> <ware> <amt>...\n"; the
+                    // payload after "ACT CARGO " is "<count> <ware> <amt>...\n".
+                    char b[16384];
+                    snprintf(b, sizeof(b), "CARGO %llu %s", (unsigned long long)key, msg + 10);
+                    for (auto& cl : g_clients) {
+                        if (cl.addr.sin_port == from.sin_port && cl.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
+                        net_send_tcp(cl, b, strlen(b));
+                    }
+                    if (g_debug) { char dbg[200]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST cargo sync (key=%llu, %d wares) applied + relayed", (unsigned long long)key, (int)wares.size()); net_debug(dbg); }
+                }
+            } else if (strncmp(msg + 4, "TRADE", 5) == 0) {
+                // Trading (host-authoritative): ACT TRADE <uid> <x> <y> <z>
+                // <ware> <delta>... — a client's player traded at a station.
+                // Apply the discrete trade to the host's copy of that station
+                // (authoritative) and relay to the other clients.
+                const char* s = msg;
+                std::vector<std::string> tokens;
+                while (*s) {
+                    while (*s == ' ') s++;
+                    if (!*s) break;
+                    const char* st = s;
+                    while (*s && *s != ' ') s++;
+                    tokens.push_back(std::string(st, (size_t)(s - st)));
+                }
+                // tokens: [ACT][TRADE][uid][x][y][z][ware][delta]...
+                if (tokens.size() >= 7) {
+                    unsigned long long uid = strtoull(tokens[2].c_str(), nullptr, 10);
+                    float fx = (float)atof(tokens[3].c_str());
+                    float fy = (float)atof(tokens[4].c_str());
+                    float fz = (float)atof(tokens[5].c_str());
+                    std::vector<std::pair<std::string,int>> deltas;
+                    for (size_t i = 6; i + 1 < tokens.size(); i += 2)
+                        deltas.push_back({ tokens[i], atoi(tokens[i + 1].c_str()) });
+                    UniverseID station = find_station_by_trade(uid, fx, fy, fz);
+                    if (station) host_apply_trade(station, deltas);
+                    // Relay to the OTHER clients (they apply it to their station).
+                    char b[16384];
+                    snprintf(b, sizeof(b), "%s", msg + 4); // "TRADE <uid> <x> <y> <z> <ware> <delta>..."
+                    for (auto& cl : g_clients) {
+                        if (cl.addr.sin_port == from.sin_port && cl.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
+                        net_send_tcp(cl, b, strlen(b));
+                    }
+                    if (g_debug) { char dbg[200]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST trade applied to station=%llu (uid=%llu, %d wares) + relayed", (unsigned long long)station, (unsigned long long)uid, (int)deltas.size()); net_debug(dbg); }
+                }
+            } else if (strncmp(msg + 4, "CAPTURE", 7) == 0) {
+                // Boarding: ACT CAPTURE <host_id> — a client captured ship
+                // host_id (boarded + took it). Make it authoritative: transfer
+                // the target to the client's ghost faction and broadcast so
+                // every client shows the capture.
+                unsigned long long hid = 0;
+                if (sscanf(msg + 11, "%llu", &hid) == 1 && hid &&
+                    g_game && g_game->IsValidComponent && g_game->SetComponentOwner &&
+                    g_game->IsValidComponent((UniverseID)hid)) {
+                    NetClient* sender = find_client(from);
+                    char cfaction[80] = {0};
+                    if (sender) client_faction_for(sender->id, cfaction, sizeof(cfaction));
+                    if (cfaction[0]) g_game->SetComponentOwner((UniverseID)hid, cfaction);
+                    char b[160];
+                    snprintf(b, sizeof(b), "CAPTURE %llu %s\n", (unsigned long long)hid, cfaction[0] ? cfaction : "player");
+                    for (auto& cl : g_clients) {
+                        if (cl.addr.sin_port == from.sin_port && cl.addr.sin_addr.s_addr == from.sin_addr.s_addr) continue;
+                        net_send_tcp(cl, b, strlen(b));
+                    }
+                    if (g_debug) { char dbg[200]; snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST capture id=%llu -> faction %s (relayed)", (unsigned long long)hid, cfaction[0] ? cfaction : "?"); net_debug(dbg); }
                 }
             }
             char lbuf[256];
@@ -1856,7 +2062,10 @@ static void net_poll() {
                 // process_message. FULL must reach x4mp_stream: it marks a
                 // complete sector snapshot and gates convergence + pruning.
                 if (strncmp(line, "OBJ", 3) == 0 || strncmp(line, "PLAYER", 6) == 0 ||
-                    strncmp(line, "FULL", 4) == 0) {
+                    strncmp(line, "FULL", 4) == 0 || strncmp(line, "STA", 3) == 0 ||
+                    strncmp(line, "KILL", 4) == 0 || strncmp(line, "PLAYERDIED", 10) == 0 ||
+                    strncmp(line, "CARGO", 5) == 0 || strncmp(line, "CAPTURE", 7) == 0 ||
+                    strncmp(line, "TRADE", 5) == 0) {
                     if (g_api && g_api->raise_event) g_api->raise_event("x4mp_stream.data", (void*)line);
                 } else {
                     process_message(line, g_host_sa);
@@ -1883,7 +2092,10 @@ static void net_poll() {
             // Legacy: every line goes to process_message (data arrives on 7778).
             if (!g_legacy_net && g_transport == "udp" &&
                 (strncmp(line, "OBJ", 3) == 0 || strncmp(line, "PLAYER", 6) == 0 ||
-                 strncmp(line, "FULL", 4) == 0)) {
+                 strncmp(line, "FULL", 4) == 0 || strncmp(line, "STA", 3) == 0 ||
+                 strncmp(line, "KILL", 4) == 0 || strncmp(line, "PLAYERDIED", 10) == 0 ||
+                 strncmp(line, "CARGO", 5) == 0 || strncmp(line, "CAPTURE", 7) == 0 ||
+                 strncmp(line, "TRADE", 5) == 0)) {
                 if (g_api && g_api->raise_event) g_api->raise_event("x4mp_stream.data", (void*)line);
             } else {
                 process_message(line, from);
@@ -1972,6 +2184,44 @@ static void net_update() {
         // sector macro map, stream cache): every ~5s while hosting, regardless
         // of whether the OBJ broadcast is enabled.
         if ((g_net_tick % 300) == 0) net_maintain_universe();
+        // Host station replication (issue 3, symmetric to ACT BUILD): baseline
+        // the save's PF stations once, then stream any NEW ones (host player
+        // builds) to all clients as STA lines so they appear on the clients.
+        if (g_universe_ready && g_game && g_game->GetAllFactionStations) {
+            if (!g_host_station_baseline_done) {
+                std::vector<UniverseID> sts;
+                uint32_t ns = enumerate_faction_stations("player", sts);
+                for (uint32_t i = 0; i < ns; i++) if (sts[i]) g_host_station_baseline.insert(sts[i]);
+                g_host_station_baseline_done = true;
+                if (g_debug) { char d[120]; snprintf(d, sizeof(d), "x4mp: [DBG] HOST station baseline: %zu", g_host_station_baseline.size()); net_debug(d); }
+            }
+            // Re-send every non-baseline station each cycle (like the client's
+            // ACT BUILD resend): STA is idempotent on the client (it spawns
+            // once), and keeping last_update fresh prevents the client's
+            // 30 s stale-drop from removing it.
+            if (g_net_tick % 200 == 0) {
+                std::vector<UniverseID> sts;
+                uint32_t ns = enumerate_faction_stations("player", sts);
+                for (uint32_t i = 0; i < ns; i++) {
+                    UniverseID s = sts[i];
+                    if (!s || g_host_station_baseline.count(s)) continue;
+                    char macro[160], smacro[160] = {0};
+                    get_macro(s, macro, sizeof(macro));
+                    UniverseID sec = g_game->GetContextByClass ? g_game->GetContextByClass(s, "sector", false) : 0;
+                    if (sec) get_macro(sec, smacro, sizeof(smacro));
+                    UIPosRot pos = g_game->GetObjectPositionInSector(s);
+                    char b[420];
+                    snprintf(b, sizeof(b), "STA %llu %s %.3f %.3f %.3f %.3f %.3f %.3f player %s\n",
+                             (unsigned long long)s, smacro[0] ? smacro : "?",
+                             pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.roll, macro[0] ? macro : "?");
+                    net_send_stream(b);
+                    if (!g_host_station_sent.count(s)) {
+                        g_host_station_sent.insert(s);
+                        if (g_debug) { char d[280]; snprintf(d, sizeof(d), "x4mp: [DBG] HOST streaming new station id=%llu macro=%s sector=%s", (unsigned long long)s, macro, smacro[0] ? smacro : "?"); net_debug(d); }
+                    }
+                }
+            }
+        }
         // Maintain per-client TCP stream connections (connect / reconnect).
         // (Skipped for UDP — no TCP connection is used for the data stream; and
         // skipped in consolidated TCP mode — the client connects to OUR listener.)
@@ -2339,6 +2589,14 @@ static void do_join(const char* server_ip) {
 // (X4MP_SAVE) if one was prepared by the launcher. The existing frame-update
 // / on_game_loaded logic then finishes the job (load save -> do_host ->
 // start_streams).
+// Combat (client): x4mp_stream detected the player's local kills / death and
+// raises this with the ACT line to send. Forward it over the control channel
+// (net_send_client). Runs on the main thread (raised from x4mp_stream's
+// on_frame_update), so the UDP sendto is safe.
+static void on_send_act(const char* /*event_name*/, void* data, void* /*userdata*/) {
+    if (g_net_client && data) net_send_client((const char*)data);
+}
+
 static void on_host_request(const char* /*event_name*/, void* data, void* /*userdata*/) {
     const char* module = (data && *(const char*)data) ? (const char*)data : nullptr;
     g_api->log(X4NATIVE_LOG_INFO, "x4mp: HOST requested (in-game menu)");
@@ -2743,6 +3001,9 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     g_sub_loaded = api->subscribe("on_game_loaded",    on_game_loaded, nullptr, api);
     g_sub_universe = api->subscribe("on_universe_ready", on_universe_ready, nullptr, api);
     g_sub_tick   = api->subscribe("on_frame_update", on_frame_update, nullptr, api);
+    // Combat: receive ACT lines (kill / player-death) from x4mp_stream and send
+    // them to the host over the control channel.
+    g_sub_send_act = api->subscribe("x4mp.send_act", on_send_act, nullptr, api);
 
     // Optional env-driven fallback (OFF by default).
     if (g_auto == "client") {
@@ -2785,6 +3046,7 @@ X4NATIVE_EXPORT void x4native_shutdown(void) {
     if (g_sub_host)   g_api->unsubscribe(g_sub_host);
     if (g_sub_join)   g_api->unsubscribe(g_sub_join);
     if (g_sub_universe) g_api->unsubscribe(g_sub_universe);
+    if (g_sub_send_act) g_api->unsubscribe(g_sub_send_act);
     if (g_sock >= 0) { net_close_fd(g_sock, "shutdown_g_sock"); g_sock = -1; }
     // Release the consolidated-mode TCP listener + any per-client connections.
     // The game re-initializes the extension on its 2-pass save load; if we don't

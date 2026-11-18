@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<content id="x4mp_join" name="X4 Multiplayer Join Service" description="Background bridge for the in-game multiplayer interface" version="1" author="X4MP contributors" save="0">
+  <dependency id="x4native" optional="false" />
+  <dependency id="x4mp" optional="false" />
+</content>

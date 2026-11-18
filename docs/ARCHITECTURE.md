@@ -1,5 +1,12 @@
 # X4Native — Architecture
 
+The framework architecture below is inherited upstream documentation. For this
+fork's experimental server-owned universe, strict readiness lifecycle, in-game
+join coordinator and CPU-only Docker path, see
+[multiplayer design decisions](MULTIPLAYER_DESIGN.md),
+[join integration](MULTIPLAYER_JOIN.md) and [host setup](HEADLESS_HOST.md).
+Those documents distinguish requirements and measured evidence from open work.
+
 ## Two-DLL Design
 
 X4Native uses a **proxy + core** two-DLL architecture to enable hot-reloading native code without restarting the game.

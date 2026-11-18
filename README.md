@@ -14,6 +14,18 @@ X4Native lets mod authors go beyond what Lua and Mission Director XML can do alo
 
 ## For Players
 
+### Experimental multiplayer host and joining
+
+This Linux fork also contains an experimental GPU-free host package and native
+support for an in-game request/sync/load join interface. Start with
+[Docker host setup](docs/HEADLESS_HOST.md), [design decisions](docs/MULTIPLAYER_DESIGN.md),
+[join integration](docs/MULTIPLAYER_JOIN.md) and [validation/known gaps](docs/VALIDATION.md).
+The companion X4Multiplayer_Mod source provides the Windows/Linux game UI.
+These are draft features, not a qualified multiplayer service or renderer-free server.
+The inherited Windows framework instructions below describe upstream context;
+this fork's top-level CMake builds Linux, while the multiplayer examples have
+separate platform builds.
+
 ### Installation
 
 1. Download the latest release
@@ -78,6 +90,8 @@ X4N_SHUTDOWN {
 | [event_test](examples/event_test) | Event round-trips (C++→Lua→C++), direct MD event subscriptions |
 | [hook_test](examples/hook_test) | Before/after hooks on game functions |
 | [lua_bridge](examples/lua_bridge) | Dynamic Lua→C++ event forwarding |
+| [x4mp](examples/x4mp) | Native multiplayer host/client lifecycle and transport |
+| [x4mp_join](examples/x4mp_join) | Portable in-game join coordinator bridge (experimental) |
 
 ---
 

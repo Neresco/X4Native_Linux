@@ -1,0 +1,30 @@
+services:
+  host:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ${X4_IMAGE:-x4-headless-host:development}
+    user: "${X4_UID:-1000}:${X4_GID:-100}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: "${X4_CPU_LIMIT:-2}"
+    mem_limit: ${X4_MEMORY_LIMIT:-12g}
+    memswap_limit: ${X4_MEMORY_LIMIT:-12g}
+    pids_limit: 512
+    shm_size: 256m
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m,mode=1777
+      - /game:rw,nosuid,nodev,exec,size=256m,mode=1777
+    stop_grace_period: ${X4_STOP_GRACE:-90s}
+    restart: "no"
+    env_file: [.env]
+    volumes:
+      - ${X4_STORAGE_ROOT:-../.local/docker-host}/game:/data/game
+      - ${X4_STORAGE_ROOT:-../.local/docker-host}/state:/state
+      - ${X4_STORAGE_ROOT:-../.local/docker-host}/cache:/cache
+      - ${X4_DOWNLOADS_ROOT:-../.local/downloads}:/downloads:ro
+      - ${X4_SECRET_ROOT:-../.local/secrets}:/run/secrets:ro
+    # No GPU devices, Docker socket, host display, or published ports.
+    # Initial downloads require outbound access. Networking/admission policy
+    # must be reviewed before enabling a multi-user or public service.

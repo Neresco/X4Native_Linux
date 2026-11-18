@@ -74,6 +74,14 @@
 #define ssize_t                 int
 #endif
 // Error constants -> WinSock equivalents.
+#undef EINTR
+#undef EAGAIN
+#undef EWOULDBLOCK
+#undef EINPROGRESS
+#undef EBADF
+#undef EPIPE
+#undef ECONNRESET
+#undef ECONNABORTED
 #define EINTR                   WSAEINTR
 #define EAGAIN                  WSAEWOULDBLOCK
 #define EWOULDBLOCK             WSAEWOULDBLOCK
@@ -82,6 +90,9 @@
 #define EPIPE                   WSAECONNRESET
 #define ECONNRESET              WSAECONNRESET
 #define ECONNABORTED            WSAECONNABORTED
+#ifdef _MSC_VER
+#define strtok_r               strtok_s
+#endif
 
 static inline int x4mp_sock_set_nonblocking(int fd) {
     u_long nb = 1;
@@ -89,7 +100,7 @@ static inline int x4mp_sock_set_nonblocking(int fd) {
 }
 
 static inline const char* x4mp_winsock_strerror(int e) {
-    char buf[256];
+    static thread_local char buf[256];
     if (FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                        0, (DWORD)e, 0, buf, (DWORD)sizeof(buf), 0) == 0) {
         buf[0] = 0;
@@ -107,6 +118,10 @@ static inline int x4mp_sock_ensure_init(void) {
         done = true;
     }
     return 0;
+}
+
+static inline bool x4mp_connect_pending(int error) {
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEALREADY;
 }
 
 // dirent stubs: net_dump_fds() is Linux-only diagnostics (reads /proc/self/fd).
@@ -136,5 +151,8 @@ static inline ssize_t         readlink(const char*, char*, size_t) { return -1; 
 
 // POSIX: WinSock is not a thing; socket() works immediately.
 static inline int x4mp_sock_ensure_init(void) { return 0; }
+static inline bool x4mp_connect_pending(int error) {
+    return error == EINPROGRESS || error == EALREADY;
+}
 
 #endif

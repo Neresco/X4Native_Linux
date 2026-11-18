@@ -1,0 +1,1 @@
+<content id="gpu_free_probe" name="GPU-free Host Bootstrap" version="1" author="X4MP contributors" description="Experimental engine startup and readiness telemetry" enabled="1" save="0" />

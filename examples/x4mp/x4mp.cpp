@@ -81,6 +81,7 @@ static int             g_sub_tick  = 0;
 static int             g_sub_loaded = 0;
 static int             g_sub_host  = 0;
 static int             g_sub_join  = 0;
+static int             g_sub_name = 0;
 static int             g_sub_universe = 0; // on_universe_ready (world fully built)
 static int             g_sub_send_act = 0; // x4mp_stream combat ACT lines (client)
 static bool            g_host_done = false;
@@ -154,6 +155,51 @@ static bool            g_client_tcp_connecting = false; // non-blocking connect 
 static std::string     g_client_tcp_buf;                // accumulates partial lines from the host
 static uint16_t        g_net_port = 7777;
 static std::string     g_net_host_ip = "192.168.1.16";
+static std::chrono::steady_clock::time_point g_client_retry_at{};
+static int g_client_retry_ms = 1000;
+
+// The framework re-discovers native extensions when a save loads or the UI
+// rebuilds. Store menu-selected intent in the proxy's process-lifetime stash,
+// rather than losing it when the extension DLL is unloaded. Never persist this
+// into a save or infer authentication/permissions from it.
+struct MenuSession {
+    uint32_t version = 1;
+    uint32_t stage = 0; // 1 selected, 2 loading, 3 universe-ready
+    char role[8]{};
+    char address[256]{};
+};
+static void remember_menu_session(uint32_t stage) {
+    if (!g_api || !g_api->stash_set || (g_auto != "client" && g_auto != "host")) return;
+    MenuSession value;
+    value.stage = stage;
+    snprintf(value.role, sizeof(value.role), "%s", g_auto.c_str());
+    snprintf(value.address, sizeof(value.address), "%s", g_net_host_ip.c_str());
+    g_api->stash_set("x4mp.session", "menu", &value, sizeof(value));
+}
+static uint32_t restore_menu_session() {
+    if (!g_api || !g_api->stash_get) return 0;
+    uint32_t size = 0;
+    const auto* value = static_cast<const MenuSession*>(g_api->stash_get("x4mp.session", "menu", &size));
+    if (!value || size != sizeof(MenuSession) || value->version != 1 ||
+        value->stage < 1 || value->stage > 3 ||
+        !memchr(value->role, 0, sizeof(value->role)) ||
+        !memchr(value->address, 0, sizeof(value->address)) ||
+        (strcmp(value->role, "client") && strcmp(value->role, "host"))) return 0;
+    // Returning to the main menu ends an already-ready session. An actual
+    // load (stage 2) must survive its temporary invalid-player interval.
+    if (value->stage == 3 && (!g_game || !g_game->IsPlayerValid || !g_game->IsPlayerValid())) {
+        if (g_api->stash_remove) g_api->stash_remove("x4mp.session", "menu");
+        return 0;
+    }
+    g_auto = value->role;
+    g_server_ip = value->address;
+    g_net_host_ip = value->address;
+    g_save_loading = value->stage == 2;
+    // A valid player and a saved intent are not proof of this load's second
+    // pass. A new UI/native instance must receive the definitive event again.
+    g_universe_ready = false;
+    return value->stage;
+}
 static struct sockaddr_in g_host_sa;
 // Data-stream transport: "tcp" (default) or "udp" (X4MP_TRANSPORT). The control
 // channel (7777) is always UDP; only the object data stream (7778) switches.
@@ -588,6 +634,10 @@ static bool net_init_client(const char* ip, uint16_t port) {
     // Consolidated TCP mode (X4MP_LEGACY_NET=0, tcp): g_sock is a TCP socket
     // that CONNECTS to the host's data port (7778). Control + data ride it.
     if (!g_legacy_net && g_transport == "tcp") {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < g_client_retry_at) return false;
+        g_client_retry_at = now + std::chrono::milliseconds(g_client_retry_ms);
+        g_client_retry_ms = (std::min)(g_client_retry_ms * 2, 30000);
         uint16_t tport = (uint16_t)g_stream_port;
         g_sock = socket(AF_INET, SOCK_STREAM, 0);
         if (g_sock < 0) { net_log("x4mp: net: socket() failed"); return false; }
@@ -605,7 +655,7 @@ static bool net_init_client(const char* ip, uint16_t port) {
         setsockopt(g_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         int r = connect(g_sock, (struct sockaddr*)&g_host_sa, sizeof(g_host_sa));
         if (r == 0) g_client_tcp_connecting = false;
-        else if (errno == EINPROGRESS) g_client_tcp_connecting = true;
+        else if (x4mp_connect_pending(errno)) g_client_tcp_connecting = true;
         else { net_log("x4mp: net: connect() failed"); net_close_fd(g_sock, "init_client_tcp_connect"); g_sock = -1; return false; }
         g_net_client = true;
         g_client_last_recv = std::chrono::steady_clock::now();
@@ -751,7 +801,7 @@ static void net_client_tcp(NetClient& c) {
         snprintf(m, sizeof(m), "x4mp: net: TCP stream connected to %s:%u",
                  inet_ntoa(c.addr.sin_addr), (unsigned)c.stream_port);
         net_log(m);
-    } else if (errno == EINPROGRESS) {
+    } else if (x4mp_connect_pending(errno)) {
         c.tcp_fd = fd; c.tcp_connecting = true; // verify next tick
     } else {
         net_close_fd(fd, "net_client_tcp_connect_fail"); c.tcp_backoff = 15;
@@ -2112,6 +2162,9 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
         if (strncmp(msg, "WELCOME", 7) == 0) {
             g_net_connected = true;
             net_log("x4mp: net: CONNECTED to host (handshake OK)");
+            g_client_retry_ms = 1000;
+            g_client_retry_at = {};
+            if (g_client_ready) net_send_client("READY\n");
         } else if (strncmp(msg, "PING", 4) == 0) {
             // Keepalive: answer so the host can confirm we are alive.
             net_send_client("PONG\n");
@@ -2826,6 +2879,22 @@ static void do_host(const char* module, const char* difficulty) {
         g_api->log(X4NATIVE_LOG_WARN, "x4mp: host already started — ignoring duplicate request");
         return;
     }
+    // Our custom transport can host the world already loaded by the player or
+    // save loader. NewMultiplayerGame would replace it and reload the UI,
+    // destroying the runtime-selected role. Wait for the definitive readiness
+    // event before enabling streams, then preserve the existing universe.
+    if (g_game && g_game->IsPlayerValid && g_game->IsPlayerValid()) {
+        if (!g_universe_ready) {
+            g_host_pending = true;
+            return;
+        }
+        g_host_pending = false;
+        g_host_done = true;
+        net_start();
+        start_streams();
+        g_api->log(X4NATIVE_LOG_INFO, "x4mp: HOST — existing universe; custom transport active");
+        return;
+    }
     g_host_done = true;
     // Start the data-stream threads only AFTER the game is loaded (creating
     // them during init interferes with the game's startup and causes shutdown).
@@ -2885,6 +2954,7 @@ static void on_host_request(const char* /*event_name*/, void* data, void* /*user
     g_api->log(X4NATIVE_LOG_INFO, "x4mp: HOST requested (in-game menu)");
     g_auto = "host";                       // set role at runtime (menu-driven)
     if (module && *module) g_module = module;
+    remember_menu_session(1);
     net_start();                           // start our custom network (UDP 7777) now
     if (!g_save.empty()) {
         g_save_pending = true;             // load the save first; do_host on game loaded
@@ -2909,6 +2979,7 @@ static void on_join_request(const char* /*event_name*/, void* data, void* /*user
     g_api->log(X4NATIVE_LOG_INFO, "x4mp: JOIN requested (in-game menu)");
     g_auto = "client";                     // set role at runtime (menu-driven)
     if (ip && *ip) { g_server_ip = ip; g_net_host_ip = ip; }
+    remember_menu_session(1);
     net_start();                           // connect our custom network (UDP 7777) now
     if (!g_save.empty()) {
         g_save_pending = true;             // load the same save; client logic connects
@@ -2920,6 +2991,20 @@ static void on_join_request(const char* /*event_name*/, void* data, void* /*user
         g_newgame_pending = true;          // no save: thin client, new game
         g_api->log(X4NATIVE_LOG_INFO, "x4mp: menu join — no save, thin client new game");
     }
+}
+
+static void on_player_name(const char*, void* data, void*) {
+    const char* name = static_cast<const char*>(data);
+    if (!name) return;
+    const size_t length = strlen(name);
+    if (!length || length > 32) return;
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-')) return;
+    }
+    g_client_name = name;
+    if (g_api->stash_set) g_api->stash_set("x4mp.session", "player_name", name, static_cast<uint32_t>(length + 1));
 }
 
 // Forward decl: client_mark_ready() is defined below (after on_frame_update).
@@ -3053,6 +3138,7 @@ static void on_frame_update(const char* /*event_name*/, void* data, void* /*user
         if (list_ready) {
             g_save_pending = false;
             g_save_loading = true;
+            remember_menu_session(2);
             char buf[512];
             snprintf(buf, sizeof(buf), "x4mp: save list ready — loading save '%s'", g_save.c_str());
             g_api->log(X4NATIVE_LOG_INFO, buf);
@@ -3245,6 +3331,7 @@ static void client_mark_ready(const char* source) {
 // game's background simulation threads.
 static void on_universe_ready(const char* /*event_name*/, void* /*data*/, void* /*userdata*/) {
     g_universe_ready = true;
+    remember_menu_session(3);
     g_api->log(X4NATIVE_LOG_INFO, "x4mp: universe ready (2nd pass complete)");
     if (g_auto != "client") return;
     g_save_loading = false;
@@ -3262,6 +3349,15 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     x4mp_sock_ensure_init(); // WinSock WSAStartup (no-op on Linux)
     read_config();
     g_game = api->game;
+    const auto resumed_session = restore_menu_session();
+    if (api->stash_get) {
+        uint32_t size = 0;
+        const auto* name = static_cast<const char*>(api->stash_get("x4mp.session", "player_name", &size));
+        if (name && size > 1 && size <= 33 && name[size - 1] == '\0') {
+            const std::string chosen(name, size - 1);
+            on_player_name(nullptr, const_cast<char*>(chosen.c_str()), nullptr);
+        }
+    }
     g_start = std::chrono::steady_clock::now();
 
     api->log(X4NATIVE_LOG_INFO, "x4mp: init (auto, server_ip)");
@@ -3282,6 +3378,7 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     // Subscribe to the bridged C++ events + lifecycle events.
     g_sub_host   = api->subscribe("x4mp_host_request", on_host_request, nullptr, api);
     g_sub_join   = api->subscribe("x4mp_join_request", on_join_request, nullptr, api);
+    g_sub_name = api->subscribe("x4mp_set_player_name", on_player_name, nullptr, api);
     g_sub_loaded = api->subscribe("on_game_loaded",    on_game_loaded, nullptr, api);
     g_sub_universe = api->subscribe("on_universe_ready", on_universe_ready, nullptr, api);
     g_sub_tick   = api->subscribe("on_frame_update", on_frame_update, nullptr, api);
@@ -3290,7 +3387,12 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     g_sub_send_act = api->subscribe("x4mp.send_act", on_send_act, nullptr, api);
 
     // Optional env-driven fallback (OFF by default).
-    if (g_auto == "client") {
+    if (resumed_session >= 2) {
+        // The verified save is already loading/loaded; replaying loadSave here
+        // would loop on every UI reload. Wait for the real lifecycle instead.
+        g_save_pending = false;
+        api->log(X4NATIVE_LOG_INFO, "x4mp: restored menu session across UI reload");
+    } else if (g_auto == "client") {
         // THIN CLIENT (Option 1 intermediate): load the SAME save as the host
         // (so sector IDs match) but do NOT simulate — pause and render ONLY
         // objects streamed from the host. If no save is specified, fall back to
@@ -3326,6 +3428,7 @@ X4NATIVE_EXPORT void x4native_shutdown(void) {
     if (!g_api) return;
     g_api->log(X4NATIVE_LOG_INFO, "x4mp: shutting down");
     if (g_sub_tick)   g_api->unsubscribe(g_sub_tick);
+    if (g_sub_name) g_api->unsubscribe(g_sub_name);
     if (g_sub_loaded) g_api->unsubscribe(g_sub_loaded);
     if (g_sub_host)   g_api->unsubscribe(g_sub_host);
     if (g_sub_join)   g_api->unsubscribe(g_sub_join);

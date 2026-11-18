@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<addon name="gpu_free_probe">
+  <environment type="menus">
+    <dependency name="ego_gameoptions" />
+    <file name="ui/gpu_free_probe_settings.lua" />
+    <file name="ui/gpu_free_probe.lua" />
+  </environment>
+</addon>

@@ -8,6 +8,26 @@
 
 ## Building
 
+### Linux fork and multiplayer draft
+
+The current top-level CMake in this fork targets Linux, despite the inherited
+Windows framework instructions below. A fresh Linux build uses:
+
+```sh
+cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux --parallel 2
+```
+
+GCC 16.2.1/CMake 4.3.0 were used for the current Linux checks. Each multiplayer
+example has its own CMake project; Windows examples were checked with MSVC 19.51.
+Use fresh build directories and the actual source/SDK ABI, not committed caches.
+See [validation](docs/VALIDATION.md) for tests, [Docker setup](docs/HEADLESS_HOST.md)
+for resource/configuration boundaries, and [design decisions](docs/MULTIPLAYER_DESIGN.md)
+for authority/readiness/UI requirements. Keep game files, auth state, private
+profiles/logs and generated binaries out of contribution commits.
+
+### Inherited Windows framework reference
+
 ```powershell
 # Add CMake to PATH (bundled with VS2022, not on PATH by default)
 $env:PATH = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;" + $env:PATH

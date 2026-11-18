@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.1.2",
+  "layer": {
+    "name": "VK_LAYER_LOCAL_X4_draw_suppression",
+    "type": "GLOBAL",
+    "library_path": "./libx4_draw_suppression.so",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "Experimental local X4 host draw suppression; opt-in only",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "x4DrawNegotiate"
+    }
+  }
+}

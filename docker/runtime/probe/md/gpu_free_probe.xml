@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GPUFreeProbe" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="md.xsd">
+  <cues>
+    <cue name="GPUFreeProbeUniverseReady" instantiate="true">
+      <conditions><event_universe_generated /></conditions>
+      <actions>
+        <debug_text text="'GPUFREE MD universe generated'" filter="general" />
+        <raise_lua_event name="'gpu_free_probe.universe_ready'" />
+      </actions>
+    </cue>
+  </cues>
+</mdscript>
